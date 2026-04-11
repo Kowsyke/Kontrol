@@ -11,8 +11,9 @@ Gestures:
   Wrist flick (LM 0 velocity)                 → KDE window tiling (Meta+Arrow)
   Fist (all 4 tips below MCP joints)          → toggle tracking lock
 
-HUD overlay (top-left):  FPS | mode | active gesture | pinch distances
-Lock state: green border = TRACKING, red border = LOCKED
+Config is read from kontrol.conf (INI format) in the same directory.
+If kontrol.conf is missing it is created with default values.
+All tuning knobs live in kontrol.conf — no need to edit this file.
 
 Press Q in preview window to quit.
 """
@@ -26,32 +27,91 @@ import math
 import wave
 import struct
 import tempfile
+import configparser
 from collections import deque
 from pathlib import Path
 
-# ── Config ────────────────────────────────────────────────────────────────────
-SCREEN_W         = 1920
-SCREEN_H         = 1080
-MIN_SMOOTH       = 0.08
-MAX_SMOOTH       = 0.35
-VELOCITY_SCALE   = 2.5
-PINCH_THRESHOLD  = 0.05
-PINCH_COOLDOWN   = 0.4
-SCROLL_DEADZONE  = 0.012
-SCROLL_SPEED     = 8.0
-FLICK_MIN_VEL    = 450
-FLICK_WINDOW_MS  = 120
-FLICK_COOLDOWN   = 0.8
-FIST_HOLD_FRAMES = 6
-CAM_ID           = 0
-FLIP             = True
-ABS_SCALE_X      = 1.0
-ABS_SCALE_Y      = 1.0
-YDOTOOL_SOCKET   = "/run/user/1000/.ydotool_socket"
-MODEL_PATH       = Path(__file__).parent / "hand_landmarker.task"
-SCREEN_DIAG      = math.hypot(SCREEN_W, SCREEN_H)
+# ── Config file ───────────────────────────────────────────────────────────────
+CONF_PATH  = Path(__file__).parent / "kontrol.conf"
+MODEL_PATH = Path(__file__).parent / "hand_landmarker.task"
+
+_DEFAULTS = {
+    "screen": {
+        "width":  "1920",
+        "height": "1080",
+    },
+    "camera": {
+        "id":   "0",
+        "flip": "true",
+    },
+    "smoothing": {
+        # Velocity-adaptive EMA: factor = clamp(vel_norm * scale, min, max)
+        # vel_norm = pixel_delta / screen_diagonal  (0..~0.15 for typical hand motion)
+        "min_smooth":     "0.08",
+        "max_smooth":     "0.35",
+        "velocity_scale": "2.5",
+    },
+    "gestures": {
+        "pinch_threshold":    "0.05",   # normalized landmark distance → click
+        "pinch_cooldown":     "0.4",    # seconds between clicks (per button)
+        "scroll_deadzone":    "0.012",  # min norm y-delta per frame before scrolling
+        "scroll_speed":       "8.0",    # ticks = max(1, int(abs(dy) * scroll_speed))
+        "flick_min_velocity": "450",    # px/s wrist velocity to register flick
+        "flick_window_ms":    "120",    # ms window for velocity measurement
+        "flick_cooldown":     "0.8",    # seconds between consecutive tiling gestures
+        "fist_hold_frames":   "6",      # frames fist must be held to toggle lock
+    },
+    "system": {
+        "ydotool_socket": "/run/user/1000/.ydotool_socket",
+        "abs_scale_x":    "1.0",   # set to 32767/1920 if cursor maps to wrong spot
+        "abs_scale_y":    "1.0",
+    },
+}
+
+
+def load_config() -> configparser.ConfigParser:
+    """
+    Load kontrol.conf, overlaying user values on top of built-in defaults.
+    If the file does not exist, write the defaults and return them.
+    """
+    cfg = configparser.ConfigParser()
+    cfg.read_dict(_DEFAULTS)        # populate defaults first
+    if not CONF_PATH.exists():
+        with open(CONF_PATH, "w") as f:
+            cfg.write(f)
+        print(f"[kontrol] Created default config: {CONF_PATH}")
+    else:
+        cfg.read(CONF_PATH)         # overlay user values
+    return cfg
+
+
+_cfg = load_config()
+
+SCREEN_W         = _cfg.getint("screen",    "width")
+SCREEN_H         = _cfg.getint("screen",    "height")
+CAM_ID           = _cfg.getint("camera",    "id")
+FLIP             = _cfg.getboolean("camera","flip")
+MIN_SMOOTH       = _cfg.getfloat("smoothing", "min_smooth")
+MAX_SMOOTH       = _cfg.getfloat("smoothing", "max_smooth")
+VELOCITY_SCALE   = _cfg.getfloat("smoothing", "velocity_scale")
+PINCH_THRESHOLD  = _cfg.getfloat("gestures", "pinch_threshold")
+PINCH_COOLDOWN   = _cfg.getfloat("gestures", "pinch_cooldown")
+SCROLL_DEADZONE  = _cfg.getfloat("gestures", "scroll_deadzone")
+SCROLL_SPEED     = _cfg.getfloat("gestures", "scroll_speed")
+FLICK_MIN_VEL    = _cfg.getfloat("gestures", "flick_min_velocity")
+FLICK_WINDOW_MS  = _cfg.getfloat("gestures", "flick_window_ms")
+FLICK_COOLDOWN   = _cfg.getfloat("gestures", "flick_cooldown")
+FIST_HOLD_FRAMES = _cfg.getint("gestures",   "fist_hold_frames")
+YDOTOOL_SOCKET   = _cfg.get("system",        "ydotool_socket")
+ABS_SCALE_X      = _cfg.getfloat("system",   "abs_scale_x")
+ABS_SCALE_Y      = _cfg.getfloat("system",   "abs_scale_y")
+
+SCREEN_DIAG = math.hypot(SCREEN_W, SCREEN_H)
 # ─────────────────────────────────────────────────────────────────────────────
 
+# Raw Linux keycodes for KDE tiling shortcuts (input-event-codes.h).
+# KEY_LEFTMETA=125, KEY_LEFT=105, KEY_RIGHT=106, KEY_UP=103, KEY_DOWN=108
+# ydotool key requires raw keycodes — NOT X11 keysym strings.
 _TILING_KEYS = {
     "right": ("125:1", "106:1", "106:0", "125:0"),
     "left":  ("125:1", "105:1", "105:0", "125:0"),
@@ -100,21 +160,27 @@ def pinch_dist(lm, a: int, b: int) -> float:
     return math.hypot(lm[a].x - lm[b].x, lm[a].y - lm[b].y)
 
 def is_finger_extended(lm, tip: int, pip: int) -> bool:
+    """Fingertip above PIP joint = extended (y increases downward in MediaPipe)."""
     return lm[tip].y < lm[pip].y
 
 def is_scroll_pose(lm) -> bool:
+    """Index + middle extended above PIP; ring + pinky curled."""
     return (is_finger_extended(lm, 8,  6)  and
             is_finger_extended(lm, 12, 10) and
             not is_finger_extended(lm, 16, 14) and
             not is_finger_extended(lm, 20, 18))
 
 def is_fist(lm) -> bool:
-    """All 4 fingertips (y) are below their MCP joints (y). y increases downward."""
+    """All 4 fingertip y-coords exceed their MCP joints (fully curled)."""
     tips = [8, 12, 16, 20]
     mcps = [5,  9, 13, 17]
     return all(lm[t].y > lm[m].y for t, m in zip(tips, mcps))
 
 def check_flick(history: deque) -> str | None:
+    """
+    Measure wrist velocity over the last FLICK_WINDOW_MS milliseconds.
+    Returns dominant-axis direction string or None.
+    """
     if len(history) < 2:
         return None
     t_now, x_now, y_now = history[-1]
@@ -134,36 +200,26 @@ def check_flick(history: deque) -> str | None:
 
 # ── Startup sound ─────────────────────────────────────────────────────────────
 def play_startup_sound():
-    """
-    Generate a short 880 Hz double-beep and play via aplay.
-    Pure stdlib (wave + struct) — no extra dependencies.
-    Runs non-blocking (Popen) so it doesn't delay startup.
-    """
+    """880 Hz double-beep via aplay. stdlib only — no extra deps."""
     rate, freq, amp = 22050, 880, 28000
-    dur, gap = 0.12, 0.04   # seconds per beep, gap between beeps
+    dur, gap = 0.12, 0.04
 
     def burst(duration: float) -> bytes:
         n = int(rate * duration)
         out = bytearray(n * 2)
         for i in range(n):
             t = i / rate
-            # Trapezoidal envelope: 10% fade-in, 80% sustain, 10% fade-out
             env = min(t / (duration * 0.1), 1.0, (duration - t) / (duration * 0.1))
-            val = int(amp * env * math.sin(2.0 * math.pi * freq * t))
-            struct.pack_into("<h", out, i * 2, val)
+            struct.pack_into("<h", out, i * 2,
+                             int(amp * env * math.sin(2.0 * math.pi * freq * t)))
         return bytes(out)
 
-    silence = bytes(int(rate * gap) * 2)
-    pcm = burst(dur) + silence + burst(dur)
-
+    pcm = burst(dur) + bytes(int(rate * gap) * 2) + burst(dur)
     tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
     with wave.open(tmp.name, "wb") as wf:
-        wf.setnchannels(1)
-        wf.setsampwidth(2)
-        wf.setframerate(rate)
+        wf.setnchannels(1);  wf.setsampwidth(2);  wf.setframerate(rate)
         wf.writeframes(pcm)
     tmp.close()
-
     subprocess.Popen(["aplay", "-q", tmp.name],
                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
@@ -180,30 +236,19 @@ def draw_skeleton(frame, lm, fw: int, fh: int):
 
 def draw_hud(frame, locked: bool, gesture: str, fps: float,
              pd_L: float, pd_R: float):
-    """
-    Top-left info panel + border + mode label.
-    Replaces all the scattered putText calls from earlier versions.
-    """
     h, w = frame.shape[:2]
-
-    # Coloured border signals lock state at a glance
     border_color = (0, 40, 200) if locked else (30, 190, 50)
     cv2.rectangle(frame, (0, 0), (w - 1, h - 1), border_color, 3)
-
-    # Large mode label bottom-centre
     mode_txt = "LOCKED" if locked else "TRACKING"
     cv2.putText(frame, mode_txt, (w // 2 - 58, h - 14),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.8, border_color, 2)
-
-    # Info panel top-left: FPS | mode | gesture | pinch distances
-    lines = [
+    for i, txt in enumerate([
         f"FPS     {fps:5.1f}",
         f"Mode    {mode_txt}",
         f"Gesture {gesture}",
         f"L-pinch {pd_L:.3f}",
         f"R-pinch {pd_R:.3f}",
-    ]
-    for i, txt in enumerate(lines):
+    ]):
         cv2.putText(frame, txt, (8, 18 + i * 18),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.45, (210, 210, 210), 1)
 
@@ -247,12 +292,12 @@ def run():
     fist_toggled_this_hold = False
 
     active_gesture = "NONE"
-    pd_L_hud = pd_R_hud = 1.0      # kept for HUD even when no landmarks
+    pd_L_hud = pd_R_hud = 1.0
     fps = 0.0;  frame_count = 0;  fps_timer = time.time()
 
     print(f"Kontrol v0.2  {SCREEN_W}x{SCREEN_H}"
           f"  smooth[{MIN_SMOOTH}-{MAX_SMOOTH}]x{VELOCITY_SCALE}"
-          f"  pinch={PINCH_THRESHOLD}  model={MODEL_PATH.name}")
+          f"  pinch={PINCH_THRESHOLD}  config={CONF_PATH.name}")
     print("  Fist = toggle lock   Q in preview = quit")
 
     with HandLandmarker.create_from_options(opts) as detector:
@@ -285,7 +330,6 @@ def run():
                 pd_L_hud = pinch_dist(lm, 4, 8)
                 pd_R_hud = pinch_dist(lm, 4, 16)
 
-                # ── Fist: runs even when locked ───────────────────────────
                 fist_now = is_fist(lm)
                 if fist_now:
                     fist_hold_count += 1
