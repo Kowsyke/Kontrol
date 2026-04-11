@@ -37,12 +37,18 @@ FLICK_MIN_VEL    = 450
 FLICK_WINDOW_MS  = 120
 FLICK_COOLDOWN   = 0.8
 FIST_HOLD_FRAMES = 6      # frames fist must be held continuously to toggle lock
+# Velocity-adaptive EMA: smooth = clamp(vel_norm * VELOCITY_SCALE, MIN, MAX)
+# vel_norm = pixel delta / screen diagonal (0.0–1.0 range, typical motion << 0.1)
+MIN_SMOOTH       = 0.08   # floor: stable aim when nearly stationary
+MAX_SMOOTH       = 0.35   # ceiling: snappy tracking for fast swipes
+VELOCITY_SCALE   = 2.5    # tuning: raise to make adaptation more aggressive
 CAM_ID           = 0
 FLIP             = True
 ABS_SCALE_X      = 1.0
 ABS_SCALE_Y      = 1.0
 YDOTOOL_SOCKET   = "/run/user/1000/.ydotool_socket"
 MODEL_PATH       = Path(__file__).parent / "hand_landmarker.task"
+SCREEN_DIAG      = math.hypot(SCREEN_W, SCREEN_H)  # normalisation denominator
 # ─────────────────────────────────────────────────────────────────────────────
 
 _TILING_KEYS = {
@@ -163,7 +169,8 @@ def run():
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
     cap.set(cv2.CAP_PROP_FPS,          30)
 
-    cx, cy        = float(SCREEN_W) / 2, float(SCREEN_H) / 2
+    cx, cy           = float(SCREEN_W) / 2, float(SCREEN_H) / 2
+    prev_tx, prev_ty = cx, cy   # previous raw target for velocity computation
     pinch_held_L  = False;  last_click_L = 0.0
     pinch_held_R  = False;  last_click_R = 0.0
     scroll_ref_y  = None
@@ -261,8 +268,15 @@ def run():
                         else:
                             tx = lm[8].x * SCREEN_W
                             ty = lm[8].y * SCREEN_H
-                            cx = cx * (1.0 - SMOOTH) + tx * SMOOTH
-                            cy = cy * (1.0 - SMOOTH) + ty * SMOOTH
+
+                            # Velocity-adaptive EMA: fast movement = snappier
+                            # tracking; slow / stationary = more stable aim.
+                            vel_norm = math.hypot(tx - prev_tx, ty - prev_ty) / SCREEN_DIAG
+                            smooth   = max(MIN_SMOOTH, min(MAX_SMOOTH,
+                                                           vel_norm * VELOCITY_SCALE))
+                            cx = cx * (1.0 - smooth) + tx * smooth
+                            cy = cy * (1.0 - smooth) + ty * smooth
+                            prev_tx, prev_ty = tx, ty
                             move_cursor(cx, cy)
 
                             if pd_R < PINCH_THRESHOLD:
