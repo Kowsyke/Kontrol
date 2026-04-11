@@ -2,14 +2,21 @@
 __pycache__/
 *.pyc
 *.pyo
+*.pyd
 venv/
 
 # MediaPipe models
 *.task
 
-# Logs
+# Runtime / logs
 *.log
 *.pid
+/tmp/*.wav
+
+# Secrets / env
+.env
+.env.*
 
 # System
 .DS_Store
+Thumbs.db
