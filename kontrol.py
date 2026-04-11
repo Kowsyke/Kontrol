@@ -8,17 +8,12 @@ Controls:
   Pinch index+thumb  (LM 8+4)                   → left click
   Pinch ring+thumb   (LM 16+4)                  → right click
   Index+middle extended, hand moves up/down     → scroll
-  Wrist flick (LM 0 velocity > threshold)       → KDE window tiling  ← NEW
-    Flick right  → Meta+Right  (tile right)
-    Flick left   → Meta+Left   (tile left)
-    Flick up     → Meta+Up     (tile up / maximise)
-    Flick down   → Meta+Down   (tile down / restore)
-  Q in preview                                  → quit
+  Wrist flick (LM 0 velocity > threshold)       → KDE window tiling
+  Fist (all tips below MCP joints)              → toggle tracking lock  ← NEW
+    LOCKED   = red border, cursor frozen
+    TRACKING = green border, normal operation
 
 Tuning knobs at top of file.
-
-NOTE: ydotool key uses raw Linux keycodes (input-event-codes.h), NOT X11
-keysym names. Key sequences are sent as "<code>:1 <code>:0" pairs.
 """
 
 import cv2
@@ -38,9 +33,10 @@ PINCH_THRESHOLD  = 0.05
 PINCH_COOLDOWN   = 0.4
 SCROLL_DEADZONE  = 0.012
 SCROLL_SPEED     = 8.0
-FLICK_MIN_VEL    = 450     # px/s wrist velocity to register as flick
-FLICK_WINDOW_MS  = 120     # ms window over which velocity is measured
-FLICK_COOLDOWN   = 0.8     # seconds between consecutive tiling gestures
+FLICK_MIN_VEL    = 450
+FLICK_WINDOW_MS  = 120
+FLICK_COOLDOWN   = 0.8
+FIST_HOLD_FRAMES = 6      # frames fist must be held continuously to toggle lock
 CAM_ID           = 0
 FLIP             = True
 ABS_SCALE_X      = 1.0
@@ -49,14 +45,11 @@ YDOTOOL_SOCKET   = "/run/user/1000/.ydotool_socket"
 MODEL_PATH       = Path(__file__).parent / "hand_landmarker.task"
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Raw Linux keycodes for tiling shortcuts (from input-event-codes.h).
-# Format fed to ydotool key: "code:1 code:0" (down then up).
-# KEY_LEFTMETA=125, KEY_LEFT=105, KEY_RIGHT=106, KEY_UP=103, KEY_DOWN=108
 _TILING_KEYS = {
-    "right": "125:1 106:1 106:0 125:0",   # Super + Right
-    "left":  "125:1 105:1 105:0 125:0",   # Super + Left
-    "up":    "125:1 103:1 103:0 125:0",   # Super + Up
-    "down":  "125:1 108:1 108:0 125:0",   # Super + Down
+    "right": ("125:1", "106:1", "106:0", "125:0"),
+    "left":  ("125:1", "105:1", "105:0", "125:0"),
+    "up":    ("125:1", "103:1", "103:0", "125:0"),
+    "down":  ("125:1", "108:1", "108:0", "125:0"),
 }
 
 os.environ["YDOTOOL_SOCKET"] = YDOTOOL_SOCKET
@@ -80,11 +73,8 @@ def ydocall(*args):
 def move_cursor(x: float, y: float):
     ydocall("mousemove", "-a", "-x", int(x * ABS_SCALE_X), "-y", int(y * ABS_SCALE_Y))
 
-def left_click():
-    ydocall("click", "0xC0")
-
-def right_click():
-    ydocall("click", "0xC1")   # BTN_RIGHT = evdev id 1 → 0x01|0xC0
+def left_click():    ydocall("click", "0xC0")
+def right_click():   ydocall("click", "0xC1")
 
 def scroll_up(ticks: int = 1):
     ydocall("mousemove", "--wheel", "-y", str(-ticks))
@@ -93,15 +83,9 @@ def scroll_down(ticks: int = 1):
     ydocall("mousemove", "--wheel", "-y", str(ticks))
 
 def tiling_key(direction: str):
-    """
-    Fire KDE Plasma 6 window-tiling shortcut (Meta+Arrow).
-    ydotool key takes raw Linux keycodes, NOT X11 keysym names.
-    Codes are separated by spaces; each "code:1" = key-down, "code:0" = key-up.
-    """
     seq = _TILING_KEYS.get(direction)
     if seq:
-        # Split into individual tokens and pass as separate args to ydotool key
-        ydocall("key", *seq.split())
+        ydocall("key", *seq)
 
 
 # ── Landmark math ─────────────────────────────────────────────────────────────
@@ -109,55 +93,55 @@ def pinch_dist(lm, a: int, b: int) -> float:
     return math.hypot(lm[a].x - lm[b].x, lm[a].y - lm[b].y)
 
 def is_finger_extended(lm, tip: int, pip: int) -> bool:
-    """Fingertip above PIP joint = extended (lower y = higher on screen)."""
     return lm[tip].y < lm[pip].y
 
 def is_scroll_pose(lm) -> bool:
-    """Index + middle up; ring + pinky curled."""
     return (is_finger_extended(lm, 8,  6)  and
             is_finger_extended(lm, 12, 10) and
             not is_finger_extended(lm, 16, 14) and
             not is_finger_extended(lm, 20, 18))
 
-def check_flick(history: deque) -> str | None:
+def is_fist(lm) -> bool:
     """
-    Compute wrist velocity over the last FLICK_WINDOW_MS milliseconds.
-    Returns 'left'|'right'|'up'|'down' if speed > FLICK_MIN_VEL px/s,
-    based on the dominant axis.  Returns None otherwise.
+    All 4 fingertips (8,12,16,20) are below their MCP base joints (5,9,13,17).
+    In MediaPipe: y increases downward, so tip.y > mcp.y means tip is below mcp
+    (finger is curled).  Thumb is excluded — a closed fist often leaves the
+    thumb partially extended.
+    """
+    tips = [8, 12, 16, 20]
+    mcps = [5,  9, 13, 17]
+    return all(lm[t].y > lm[m].y for t, m in zip(tips, mcps))
 
-    history entries: (timestamp_s, x_px, y_px)
-    """
+def check_flick(history: deque) -> str | None:
     if len(history) < 2:
         return None
-
     t_now, x_now, y_now = history[-1]
     t_cutoff = t_now - FLICK_WINDOW_MS / 1000.0
-
-    # Oldest sample still within the measurement window
-    oldest = None
-    for entry in history:
-        if entry[0] >= t_cutoff:
-            oldest = entry
-            break
+    oldest = next((e for e in history if e[0] >= t_cutoff), None)
     if oldest is None or oldest is history[-1]:
         return None
-
     t0, x0, y0 = oldest
     dt = t_now - t0
     if dt < 0.001:
         return None
-
-    vx = (x_now - x0) / dt   # px/s
-    vy = (y_now - y0) / dt
-
+    vx, vy = (x_now - x0) / dt, (y_now - y0) / dt
     if math.hypot(vx, vy) < FLICK_MIN_VEL:
         return None
+    return ("right" if vx > 0 else "left") if abs(vx) >= abs(vy) else ("down" if vy > 0 else "up")
 
-    # Primary axis decides direction
-    if abs(vx) >= abs(vy):
-        return "right" if vx > 0 else "left"
-    else:
-        return "down" if vy > 0 else "up"
+
+# ── Drawing helpers ───────────────────────────────────────────────────────────
+def draw_lock_overlay(frame, locked: bool, gesture_label: str):
+    """Border + large mode label to make lock state immediately obvious."""
+    h, w = frame.shape[:2]
+    color = (0, 40, 200) if locked else (30, 190, 50)
+    cv2.rectangle(frame, (0, 0), (w - 1, h - 1), color, 3)
+
+    label = "LOCKED" if locked else "TRACKING"
+    cv2.putText(frame, label, (w // 2 - 58, h - 14),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
+    cv2.putText(frame, gesture_label, (10, 34),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.65, (80, 200, 80), 2)
 
 
 # ── Main loop ─────────────────────────────────────────────────────────────────
@@ -183,11 +167,16 @@ def run():
     pinch_held_L  = False;  last_click_L = 0.0
     pinch_held_R  = False;  last_click_R = 0.0
     scroll_ref_y  = None
-    wrist_history = deque(maxlen=30)   # (t, x_px, y_px)
+    wrist_history = deque(maxlen=30)
     last_flick_t  = 0.0
+
+    locked                 = False
+    fist_hold_count        = 0
+    fist_toggled_this_hold = False  # prevents toggling twice per single held fist
+
     fps = 0.0;  frame_count = 0;  fps_timer = time.time()
 
-    print("Kontrol running — press Q in preview to quit")
+    print("Kontrol running — fist to toggle lock — press Q in preview to quit")
 
     with HandLandmarker.create_from_options(opts) as detector:
         while cap.isOpened():
@@ -214,88 +203,104 @@ def run():
             if result.hand_landmarks:
                 lm = result.hand_landmarks[0]
 
-                # Always track wrist position for flick detection
                 wrist_history.append((now,
                                       lm[0].x * SCREEN_W,
                                       lm[0].y * SCREEN_H))
 
-                pd_L = pinch_dist(lm, 4, 8)
-                pd_R = pinch_dist(lm, 4, 16)
+                # ── Fist detection runs always (even when locked) ─────────
+                fist_now = is_fist(lm)
+                if fist_now:
+                    fist_hold_count += 1
+                else:
+                    fist_hold_count = 0
+                    fist_toggled_this_hold = False   # arm for next fist hold
 
-                if is_scroll_pose(lm):
-                    # ── Scroll — suppress flick detection while scrolling ──
-                    cur_y = lm[8].y
-                    if scroll_ref_y is None:
-                        scroll_ref_y = cur_y
-                    else:
-                        dy = cur_y - scroll_ref_y
-                        scroll_ref_y = cur_y
-                        if abs(dy) > SCROLL_DEADZONE:
-                            ticks = max(1, int(abs(dy) * SCROLL_SPEED))
-                            if dy < 0:
-                                scroll_up(ticks);   gesture_label = f"SCROLL UP x{ticks}"
-                            else:
-                                scroll_down(ticks); gesture_label = f"SCROLL DN x{ticks}"
-                        else:
-                            gesture_label = "SCROLL"
+                # Toggle on the first frame we've held long enough (once per hold)
+                if fist_hold_count >= FIST_HOLD_FRAMES and not fist_toggled_this_hold:
+                    locked = not locked
+                    fist_toggled_this_hold = True
 
-                    for lm_idx in [8, 12]:
-                        px = (int(lm[lm_idx].x * fw_px), int(lm[lm_idx].y * fh_px))
-                        cv2.circle(frame, px, 14, (0, 200, 255), -1)
-                        cv2.circle(frame, px, 14, (255, 255, 255), 2)
+                if locked:
+                    gesture_label = "FIST-LOCKED" if fist_now else "LOCKED"
+                    # Cursor is intentionally frozen — no move_cursor() call
 
                 else:
-                    scroll_ref_y = None
+                    # ── All gesture branches (only when tracking) ─────────
+                    pd_L = pinch_dist(lm, 4, 8)
+                    pd_R = pinch_dist(lm, 4, 16)
 
-                    # ── Wrist flick → KDE window tiling ───────────────────
-                    flick = check_flick(wrist_history)
-                    if flick and (now - last_flick_t) > FLICK_COOLDOWN:
-                        tiling_key(flick)
-                        last_flick_t = now
-                        gesture_label = f"FLICK {flick.upper()}"
-                        wrist_history.clear()  # prevent re-triggering on same motion
+                    if is_scroll_pose(lm):
+                        cur_y = lm[8].y
+                        if scroll_ref_y is None:
+                            scroll_ref_y = cur_y
+                        else:
+                            dy = cur_y - scroll_ref_y
+                            scroll_ref_y = cur_y
+                            if abs(dy) > SCROLL_DEADZONE:
+                                ticks = max(1, int(abs(dy) * SCROLL_SPEED))
+                                if dy < 0:
+                                    scroll_up(ticks);   gesture_label = f"SCROLL UP x{ticks}"
+                                else:
+                                    scroll_down(ticks); gesture_label = f"SCROLL DN x{ticks}"
+                            else:
+                                gesture_label = "SCROLL"
+
+                        for lm_idx in [8, 12]:
+                            px = (int(lm[lm_idx].x * fw_px), int(lm[lm_idx].y * fh_px))
+                            cv2.circle(frame, px, 14, (0, 200, 255), -1)
+                            cv2.circle(frame, px, 14, (255, 255, 255), 2)
                     else:
-                        # ── Cursor + clicks ────────────────────────────────
-                        tx = lm[8].x * SCREEN_W
-                        ty = lm[8].y * SCREEN_H
-                        cx = cx * (1.0 - SMOOTH) + tx * SMOOTH
-                        cy = cy * (1.0 - SMOOTH) + ty * SMOOTH
-                        move_cursor(cx, cy)
+                        scroll_ref_y = None
 
-                        if pd_R < PINCH_THRESHOLD:
-                            if not pinch_held_R and (now - last_click_R) > PINCH_COOLDOWN:
-                                right_click(); last_click_R = now
-                            pinch_held_R = True
-                            gesture_label = f"RIGHT CLICK d={pd_R:.3f}"
+                        flick = check_flick(wrist_history)
+                        if flick and (now - last_flick_t) > FLICK_COOLDOWN:
+                            tiling_key(flick)
+                            last_flick_t = now
+                            gesture_label = f"FLICK {flick.upper()}"
+                            wrist_history.clear()
                         else:
-                            pinch_held_R = False
+                            tx = lm[8].x * SCREEN_W
+                            ty = lm[8].y * SCREEN_H
+                            cx = cx * (1.0 - SMOOTH) + tx * SMOOTH
+                            cy = cy * (1.0 - SMOOTH) + ty * SMOOTH
+                            move_cursor(cx, cy)
 
-                        if pd_L < PINCH_THRESHOLD and not (pd_R < PINCH_THRESHOLD):
-                            if not pinch_held_L and (now - last_click_L) > PINCH_COOLDOWN:
-                                left_click(); last_click_L = now
-                            pinch_held_L = True
-                            gesture_label = f"LEFT CLICK  d={pd_L:.3f}"
-                        else:
-                            pinch_held_L = False
+                            if pd_R < PINCH_THRESHOLD:
+                                if not pinch_held_R and (now - last_click_R) > PINCH_COOLDOWN:
+                                    right_click(); last_click_R = now
+                                pinch_held_R = True
+                                gesture_label = f"RIGHT CLICK d={pd_R:.3f}"
+                            else:
+                                pinch_held_R = False
 
-                        if not (pd_L < PINCH_THRESHOLD) and not (pd_R < PINCH_THRESHOLD):
-                            gesture_label = "CURSOR"
+                            if pd_L < PINCH_THRESHOLD and not (pd_R < PINCH_THRESHOLD):
+                                if not pinch_held_L and (now - last_click_L) > PINCH_COOLDOWN:
+                                    left_click(); last_click_L = now
+                                pinch_held_L = True
+                                gesture_label = f"LEFT CLICK  d={pd_L:.3f}"
+                            else:
+                                pinch_held_L = False
 
-                    # Skeleton
-                    for c in HandLandmarksConnections.HAND_CONNECTIONS:
-                        ax, ay = int(lm[c.start].x*fw_px), int(lm[c.start].y*fh_px)
-                        bx, by = int(lm[c.end].x  *fw_px), int(lm[c.end].y  *fh_px)
-                        cv2.line(frame, (ax,ay), (bx,by), (60,160,60), 1)
-                    for lmk in lm:
-                        cv2.circle(frame, (int(lmk.x*fw_px), int(lmk.y*fh_px)),
-                                   3, (100,200,100), -1)
+                            if not (pd_L < PINCH_THRESHOLD) and not (pd_R < PINCH_THRESHOLD):
+                                gesture_label = "CURSOR"
+
+                        # Skeleton (only in tracking mode)
+                        for c in HandLandmarksConnections.HAND_CONNECTIONS:
+                            ax,ay = int(lm[c.start].x*fw_px), int(lm[c.start].y*fh_px)
+                            bx,by = int(lm[c.end].x  *fw_px), int(lm[c.end].y  *fh_px)
+                            cv2.line(frame, (ax,ay), (bx,by), (60,160,60), 1)
+                        for lmk in lm:
+                            cv2.circle(frame, (int(lmk.x*fw_px), int(lmk.y*fh_px)),
+                                       3, (100,200,100), -1)
             else:
+                fist_hold_count = 0
+                fist_toggled_this_hold = False
                 scroll_ref_y = None
+                gesture_label = "NONE"
 
-            cv2.putText(frame, gesture_label, (10, 34),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (80, 200, 80), 2)
-            cv2.putText(frame, f"FPS {fps:.0f}", (fw_px-90, 24),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200,200,200), 1)
+            draw_lock_overlay(frame, locked, gesture_label)
+            cv2.putText(frame, f"FPS {fps:.0f}", (fw_px - 90, 24),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
             cv2.imshow("Kontrol", frame)
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 print("Quit."); break
