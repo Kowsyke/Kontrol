@@ -1,19 +1,20 @@
 #!/usr/bin/env python3
 """
-Kontrol v0.2-dev — Hand gesture mouse control
+Kontrol v0.2 — Hand gesture mouse control
 MediaPipe Tasks API (0.10+) → ydotool (no pynput, Wayland-safe)
 
-Controls:
-  Index fingertip (LM 8)                        → cursor position
-  Pinch index+thumb  (LM 8+4)                   → left click
-  Pinch ring+thumb   (LM 16+4)                  → right click
-  Index+middle extended, hand moves up/down     → scroll
-  Wrist flick (LM 0 velocity > threshold)       → KDE window tiling
-  Fist (all tips below MCP joints)              → toggle tracking lock  ← NEW
-    LOCKED   = red border, cursor frozen
-    TRACKING = green border, normal operation
+Gestures:
+  Index fingertip (LM 8)                      → cursor (velocity-adaptive EMA)
+  Pinch index+thumb  (LM 8+4)                 → left click
+  Pinch ring+thumb   (LM 16+4)                → right click
+  Index+middle extended, ring+pinky curled    → scroll (up/down with speed scaling)
+  Wrist flick (LM 0 velocity)                 → KDE window tiling (Meta+Arrow)
+  Fist (all 4 tips below MCP joints)          → toggle tracking lock
 
-Tuning knobs at top of file.
+HUD overlay (top-left):  FPS | mode | active gesture | pinch distances
+Lock state: green border = TRACKING, red border = LOCKED
+
+Press Q in preview window to quit.
 """
 
 import cv2
@@ -22,13 +23,18 @@ import subprocess
 import time
 import os
 import math
+import wave
+import struct
+import tempfile
 from collections import deque
 from pathlib import Path
 
 # ── Config ────────────────────────────────────────────────────────────────────
 SCREEN_W         = 1920
 SCREEN_H         = 1080
-SMOOTH           = 0.2
+MIN_SMOOTH       = 0.08
+MAX_SMOOTH       = 0.35
+VELOCITY_SCALE   = 2.5
 PINCH_THRESHOLD  = 0.05
 PINCH_COOLDOWN   = 0.4
 SCROLL_DEADZONE  = 0.012
@@ -36,19 +42,14 @@ SCROLL_SPEED     = 8.0
 FLICK_MIN_VEL    = 450
 FLICK_WINDOW_MS  = 120
 FLICK_COOLDOWN   = 0.8
-FIST_HOLD_FRAMES = 6      # frames fist must be held continuously to toggle lock
-# Velocity-adaptive EMA: smooth = clamp(vel_norm * VELOCITY_SCALE, MIN, MAX)
-# vel_norm = pixel delta / screen diagonal (0.0–1.0 range, typical motion << 0.1)
-MIN_SMOOTH       = 0.08   # floor: stable aim when nearly stationary
-MAX_SMOOTH       = 0.35   # ceiling: snappy tracking for fast swipes
-VELOCITY_SCALE   = 2.5    # tuning: raise to make adaptation more aggressive
+FIST_HOLD_FRAMES = 6
 CAM_ID           = 0
 FLIP             = True
 ABS_SCALE_X      = 1.0
 ABS_SCALE_Y      = 1.0
 YDOTOOL_SOCKET   = "/run/user/1000/.ydotool_socket"
 MODEL_PATH       = Path(__file__).parent / "hand_landmarker.task"
-SCREEN_DIAG      = math.hypot(SCREEN_W, SCREEN_H)  # normalisation denominator
+SCREEN_DIAG      = math.hypot(SCREEN_W, SCREEN_H)
 # ─────────────────────────────────────────────────────────────────────────────
 
 _TILING_KEYS = {
@@ -108,12 +109,7 @@ def is_scroll_pose(lm) -> bool:
             not is_finger_extended(lm, 20, 18))
 
 def is_fist(lm) -> bool:
-    """
-    All 4 fingertips (8,12,16,20) are below their MCP base joints (5,9,13,17).
-    In MediaPipe: y increases downward, so tip.y > mcp.y means tip is below mcp
-    (finger is curled).  Thumb is excluded — a closed fist often leaves the
-    thumb partially extended.
-    """
+    """All 4 fingertips (y) are below their MCP joints (y). y increases downward."""
     tips = [8, 12, 16, 20]
     mcps = [5,  9, 13, 17]
     return all(lm[t].y > lm[m].y for t, m in zip(tips, mcps))
@@ -136,24 +132,91 @@ def check_flick(history: deque) -> str | None:
     return ("right" if vx > 0 else "left") if abs(vx) >= abs(vy) else ("down" if vy > 0 else "up")
 
 
-# ── Drawing helpers ───────────────────────────────────────────────────────────
-def draw_lock_overlay(frame, locked: bool, gesture_label: str):
-    """Border + large mode label to make lock state immediately obvious."""
-    h, w = frame.shape[:2]
-    color = (0, 40, 200) if locked else (30, 190, 50)
-    cv2.rectangle(frame, (0, 0), (w - 1, h - 1), color, 3)
+# ── Startup sound ─────────────────────────────────────────────────────────────
+def play_startup_sound():
+    """
+    Generate a short 880 Hz double-beep and play via aplay.
+    Pure stdlib (wave + struct) — no extra dependencies.
+    Runs non-blocking (Popen) so it doesn't delay startup.
+    """
+    rate, freq, amp = 22050, 880, 28000
+    dur, gap = 0.12, 0.04   # seconds per beep, gap between beeps
 
-    label = "LOCKED" if locked else "TRACKING"
-    cv2.putText(frame, label, (w // 2 - 58, h - 14),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
-    cv2.putText(frame, gesture_label, (10, 34),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.65, (80, 200, 80), 2)
+    def burst(duration: float) -> bytes:
+        n = int(rate * duration)
+        out = bytearray(n * 2)
+        for i in range(n):
+            t = i / rate
+            # Trapezoidal envelope: 10% fade-in, 80% sustain, 10% fade-out
+            env = min(t / (duration * 0.1), 1.0, (duration - t) / (duration * 0.1))
+            val = int(amp * env * math.sin(2.0 * math.pi * freq * t))
+            struct.pack_into("<h", out, i * 2, val)
+        return bytes(out)
+
+    silence = bytes(int(rate * gap) * 2)
+    pcm = burst(dur) + silence + burst(dur)
+
+    tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+    with wave.open(tmp.name, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(rate)
+        wf.writeframes(pcm)
+    tmp.close()
+
+    subprocess.Popen(["aplay", "-q", tmp.name],
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+# ── Drawing helpers ───────────────────────────────────────────────────────────
+def draw_skeleton(frame, lm, fw: int, fh: int):
+    for c in HandLandmarksConnections.HAND_CONNECTIONS:
+        ax, ay = int(lm[c.start].x * fw), int(lm[c.start].y * fh)
+        bx, by = int(lm[c.end].x   * fw), int(lm[c.end].y   * fh)
+        cv2.line(frame, (ax, ay), (bx, by), (60, 160, 60), 1)
+    for lmk in lm:
+        cv2.circle(frame, (int(lmk.x * fw), int(lmk.y * fh)), 3, (100, 200, 100), -1)
+
+
+def draw_hud(frame, locked: bool, gesture: str, fps: float,
+             pd_L: float, pd_R: float):
+    """
+    Top-left info panel + border + mode label.
+    Replaces all the scattered putText calls from earlier versions.
+    """
+    h, w = frame.shape[:2]
+
+    # Coloured border signals lock state at a glance
+    border_color = (0, 40, 200) if locked else (30, 190, 50)
+    cv2.rectangle(frame, (0, 0), (w - 1, h - 1), border_color, 3)
+
+    # Large mode label bottom-centre
+    mode_txt = "LOCKED" if locked else "TRACKING"
+    cv2.putText(frame, mode_txt, (w // 2 - 58, h - 14),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8, border_color, 2)
+
+    # Info panel top-left: FPS | mode | gesture | pinch distances
+    lines = [
+        f"FPS     {fps:5.1f}",
+        f"Mode    {mode_txt}",
+        f"Gesture {gesture}",
+        f"L-pinch {pd_L:.3f}",
+        f"R-pinch {pd_R:.3f}",
+    ]
+    for i, txt in enumerate(lines):
+        cv2.putText(frame, txt, (8, 18 + i * 18),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (210, 210, 210), 1)
 
 
 # ── Main loop ─────────────────────────────────────────────────────────────────
 def run():
     if not MODEL_PATH.exists():
-        raise FileNotFoundError(f"Model not found: {MODEL_PATH}")
+        raise FileNotFoundError(
+            f"Model not found: {MODEL_PATH}\n"
+            "Download:\n  curl -L -o hand_landmarker.task "
+            "https://storage.googleapis.com/mediapipe-models/"
+            "hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task"
+        )
 
     opts = HandLandmarkerOptions(
         base_options=BaseOptions(model_asset_path=str(MODEL_PATH)),
@@ -169,8 +232,10 @@ def run():
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
     cap.set(cv2.CAP_PROP_FPS,          30)
 
+    play_startup_sound()
+
     cx, cy           = float(SCREEN_W) / 2, float(SCREEN_H) / 2
-    prev_tx, prev_ty = cx, cy   # previous raw target for velocity computation
+    prev_tx, prev_ty = cx, cy
     pinch_held_L  = False;  last_click_L = 0.0
     pinch_held_R  = False;  last_click_R = 0.0
     scroll_ref_y  = None
@@ -179,11 +244,16 @@ def run():
 
     locked                 = False
     fist_hold_count        = 0
-    fist_toggled_this_hold = False  # prevents toggling twice per single held fist
+    fist_toggled_this_hold = False
 
+    active_gesture = "NONE"
+    pd_L_hud = pd_R_hud = 1.0      # kept for HUD even when no landmarks
     fps = 0.0;  frame_count = 0;  fps_timer = time.time()
 
-    print("Kontrol running — fist to toggle lock — press Q in preview to quit")
+    print(f"Kontrol v0.2  {SCREEN_W}x{SCREEN_H}"
+          f"  smooth[{MIN_SMOOTH}-{MAX_SMOOTH}]x{VELOCITY_SCALE}"
+          f"  pinch={PINCH_THRESHOLD}  model={MODEL_PATH.name}")
+    print("  Fist = toggle lock   Q in preview = quit")
 
     with HandLandmarker.create_from_options(opts) as detector:
         while cap.isOpened():
@@ -205,8 +275,6 @@ def run():
             mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
             result   = detector.detect(mp_image)
 
-            gesture_label = "NONE"
-
             if result.hand_landmarks:
                 lm = result.hand_landmarks[0]
 
@@ -214,28 +282,25 @@ def run():
                                       lm[0].x * SCREEN_W,
                                       lm[0].y * SCREEN_H))
 
-                # ── Fist detection runs always (even when locked) ─────────
+                pd_L_hud = pinch_dist(lm, 4, 8)
+                pd_R_hud = pinch_dist(lm, 4, 16)
+
+                # ── Fist: runs even when locked ───────────────────────────
                 fist_now = is_fist(lm)
                 if fist_now:
                     fist_hold_count += 1
                 else:
                     fist_hold_count = 0
-                    fist_toggled_this_hold = False   # arm for next fist hold
+                    fist_toggled_this_hold = False
 
-                # Toggle on the first frame we've held long enough (once per hold)
                 if fist_hold_count >= FIST_HOLD_FRAMES and not fist_toggled_this_hold:
                     locked = not locked
                     fist_toggled_this_hold = True
 
                 if locked:
-                    gesture_label = "FIST-LOCKED" if fist_now else "LOCKED"
-                    # Cursor is intentionally frozen — no move_cursor() call
+                    active_gesture = "FIST-LOCKED" if fist_now else "LOCKED"
 
                 else:
-                    # ── All gesture branches (only when tracking) ─────────
-                    pd_L = pinch_dist(lm, 4, 8)
-                    pd_R = pinch_dist(lm, 4, 16)
-
                     if is_scroll_pose(lm):
                         cur_y = lm[8].y
                         if scroll_ref_y is None:
@@ -246,11 +311,13 @@ def run():
                             if abs(dy) > SCROLL_DEADZONE:
                                 ticks = max(1, int(abs(dy) * SCROLL_SPEED))
                                 if dy < 0:
-                                    scroll_up(ticks);   gesture_label = f"SCROLL UP x{ticks}"
+                                    scroll_up(ticks)
+                                    active_gesture = f"SCROLL UP x{ticks}"
                                 else:
-                                    scroll_down(ticks); gesture_label = f"SCROLL DN x{ticks}"
+                                    scroll_down(ticks)
+                                    active_gesture = f"SCROLL DN x{ticks}"
                             else:
-                                gesture_label = "SCROLL"
+                                active_gesture = "SCROLL"
 
                         for lm_idx in [8, 12]:
                             px = (int(lm[lm_idx].x * fw_px), int(lm[lm_idx].y * fh_px))
@@ -263,14 +330,12 @@ def run():
                         if flick and (now - last_flick_t) > FLICK_COOLDOWN:
                             tiling_key(flick)
                             last_flick_t = now
-                            gesture_label = f"FLICK {flick.upper()}"
+                            active_gesture = f"FLICK {flick.upper()}"
                             wrist_history.clear()
                         else:
                             tx = lm[8].x * SCREEN_W
                             ty = lm[8].y * SCREEN_H
 
-                            # Velocity-adaptive EMA: fast movement = snappier
-                            # tracking; slow / stationary = more stable aim.
                             vel_norm = math.hypot(tx - prev_tx, ty - prev_ty) / SCREEN_DIAG
                             smooth   = max(MIN_SMOOTH, min(MAX_SMOOTH,
                                                            vel_norm * VELOCITY_SCALE))
@@ -279,43 +344,35 @@ def run():
                             prev_tx, prev_ty = tx, ty
                             move_cursor(cx, cy)
 
-                            if pd_R < PINCH_THRESHOLD:
+                            if pd_R_hud < PINCH_THRESHOLD:
                                 if not pinch_held_R and (now - last_click_R) > PINCH_COOLDOWN:
                                     right_click(); last_click_R = now
                                 pinch_held_R = True
-                                gesture_label = f"RIGHT CLICK d={pd_R:.3f}"
+                                active_gesture = f"RIGHT CLICK d={pd_R_hud:.3f}"
                             else:
                                 pinch_held_R = False
 
-                            if pd_L < PINCH_THRESHOLD and not (pd_R < PINCH_THRESHOLD):
+                            if pd_L_hud < PINCH_THRESHOLD and not (pd_R_hud < PINCH_THRESHOLD):
                                 if not pinch_held_L and (now - last_click_L) > PINCH_COOLDOWN:
                                     left_click(); last_click_L = now
                                 pinch_held_L = True
-                                gesture_label = f"LEFT CLICK  d={pd_L:.3f}"
+                                active_gesture = f"LEFT CLICK  d={pd_L_hud:.3f}"
                             else:
                                 pinch_held_L = False
 
-                            if not (pd_L < PINCH_THRESHOLD) and not (pd_R < PINCH_THRESHOLD):
-                                gesture_label = "CURSOR"
+                            if not (pd_L_hud < PINCH_THRESHOLD) and \
+                               not (pd_R_hud < PINCH_THRESHOLD):
+                                active_gesture = "CURSOR"
 
-                        # Skeleton (only in tracking mode)
-                        for c in HandLandmarksConnections.HAND_CONNECTIONS:
-                            ax,ay = int(lm[c.start].x*fw_px), int(lm[c.start].y*fh_px)
-                            bx,by = int(lm[c.end].x  *fw_px), int(lm[c.end].y  *fh_px)
-                            cv2.line(frame, (ax,ay), (bx,by), (60,160,60), 1)
-                        for lmk in lm:
-                            cv2.circle(frame, (int(lmk.x*fw_px), int(lmk.y*fh_px)),
-                                       3, (100,200,100), -1)
+                        draw_skeleton(frame, lm, fw_px, fh_px)
             else:
                 fist_hold_count = 0
                 fist_toggled_this_hold = False
                 scroll_ref_y = None
-                gesture_label = "NONE"
+                active_gesture = "NONE"
 
-            draw_lock_overlay(frame, locked, gesture_label)
-            cv2.putText(frame, f"FPS {fps:.0f}", (fw_px - 90, 24),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
-            cv2.imshow("Kontrol", frame)
+            draw_hud(frame, locked, active_gesture, fps, pd_L_hud, pd_R_hud)
+            cv2.imshow("Kontrol v0.2", frame)
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 print("Quit."); break
 
