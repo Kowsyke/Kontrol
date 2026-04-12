@@ -78,6 +78,7 @@ _DEFAULTS = {
         "max_smooth":         "0.18",
         "velocity_scale":     "2.0",
         "cursor_deadzone_px": "2",     # skip moves ≤ this to kill residual jitter
+        "still_threshold":    "0.0015", # vel_norm below this → freeze EMA (kills drift)
     },
     "gestures": {
         "pinch_threshold":      "0.05",
@@ -128,7 +129,8 @@ LANDMARK_SMOOTH    = _cfg.getfloat("smoothing", "landmark_smooth")
 MIN_SMOOTH         = _cfg.getfloat("smoothing", "min_smooth")
 MAX_SMOOTH         = _cfg.getfloat("smoothing", "max_smooth")
 VELOCITY_SCALE     = _cfg.getfloat("smoothing", "velocity_scale")
-CURSOR_DEADZONE_PX = _cfg.getint("smoothing",  "cursor_deadzone_px")
+CURSOR_DEADZONE_PX = _cfg.getint("smoothing",   "cursor_deadzone_px")
+STILL_THRESHOLD    = _cfg.getfloat("smoothing", "still_threshold")
 PINCH_THRESHOLD    = _cfg.getfloat("gestures", "pinch_threshold")
 PINCH_COOLDOWN     = _cfg.getfloat("gestures", "pinch_cooldown")
 SCROLL_DEADZONE    = _cfg.getfloat("gestures", "scroll_deadzone")
@@ -431,10 +433,20 @@ def run():
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
     cap.set(cv2.CAP_PROP_FPS,          30)
 
-    # Re-apply v4l2 tuning AFTER VideoCapture opens the device.
-    # cv2.VideoCapture() resets UVC controls to driver defaults on open.
+    # Apply v4l2 tuning twice:
+    #   Pass 1 — before stream-on, catches most controls.
+    #   Pass 2 — after 5 warm-up reads that trigger VIDIOC_STREAMON.
+    #   The C920 resets exposure_time_absolute (and sometimes gain) when the
+    #   stream starts; pass 2 re-locks everything after that reset fires.
     _tune = Path(__file__).parent / "cam-tune.sh"
     if _tune.exists():
+        subprocess.run(["bash", str(_tune)],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    for _ in range(5):       # trigger VIDIOC_STREAMON + drain startup frames
+        cap.read()
+
+    if _tune.exists():       # re-apply — locks exposure after stream-on reset
         subprocess.run(["bash", str(_tune)],
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
@@ -633,10 +645,13 @@ def run():
 
                         # Stage 2: velocity-adaptive screen-space EMA
                         vel_norm = math.hypot(tx - prev_tx, ty - prev_ty) / SCREEN_DIAG
-                        smooth   = _clamp(vel_norm * VELOCITY_SCALE * boost, MIN_SMOOTH, MAX_SMOOTH)
-                        cx = cx * (1.0 - smooth) + tx * smooth
-                        cy = cy * (1.0 - smooth) + ty * smooth
                         prev_tx, prev_ty = tx, ty
+                        # Stillness gate: freeze EMA when hand is not moving.
+                        # Prevents landmark jitter accumulating into cx/cy drift.
+                        if vel_norm > STILL_THRESHOLD:
+                            smooth = _clamp(vel_norm * VELOCITY_SCALE * boost, MIN_SMOOTH, MAX_SMOOTH)
+                            cx = cx * (1.0 - smooth) + tx * smooth
+                            cy = cy * (1.0 - smooth) + ty * smooth
 
                         dx = round(cx - prev_sent_x)
                         dy = round(cy - prev_sent_y)
