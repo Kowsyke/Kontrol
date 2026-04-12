@@ -1,24 +1,33 @@
 #!/usr/bin/env python3
 """
-Kontrol v0.4 — Hand gesture mouse control
+Kontrol v0.5 — Hand gesture mouse control  ("Stark Pass")
 MediaPipe Tasks API (0.10+) → ydotool (no pynput, Wayland-safe)
 
-Gestures:
-  Index fingertip (LM 8)                      → cursor (velocity-adaptive EMA)
-  Pinch index+thumb hold+move (LM 8+4)        → drag window (mousedown while held, mouseup on release)
-  Pinch index+thumb quick tap  (LM 8+4)       → left click (same gesture, instant release = click)
-  Pinch ring+thumb   (LM 16+4)                → right click
-  Index+middle extended, ring+pinky curled    → scroll (up/down with speed scaling)
-  Wrist flick (LM 0 velocity, axis-pure)      → KDE window tiling (Meta+Arrow)
-  Wrist rotate (fingers pointing down)        → KDE task overview (Meta+PgUp)
-  Fist SHORT  (<  fist_minimize_frames)       → ignored
-  Fist MEDIUM (>= fist_minimize_frames, released before fist_lock_frames) → minimize window
-  Fist LONG   (>= fist_lock_frames, held)     → toggle tracking lock
+Gesture priority order:
+  1. Fist LONG   (>= fist_lock_frames, held)                      → toggle tracking lock
+  2. Fist MEDIUM (>= fist_minimize_frames, released < lock_frames) → minimize window
+  3. Wrist rotate (fingers pointing down, LM12 y > LM0 y + 0.10)  → KDE task overview
+  4. Index+middle extended, ring+pinky curled                       → scroll (velocity-scaled)
+  5. Wrist flick (LM 0 axis-pure velocity)                         → KDE window tiling
+  6. Ring+thumb pinch (LM 16+4)                                    → right click
+  7. Index+thumb hold+move (LM 8+4)                               → drag (mousedown/mouseup)
+  8. Index+thumb quick tap                                         → left click
+  9. Index fingertip (LM 8) — zone-mapped, double EMA             → cursor
+
+v0.5 additions:
+  - Zone-based hand mapping: [zone_x_min..zone_x_max] → full screen + edge_boost
+  - Double EMA: landmark pre-filter (fixed alpha) → velocity-adaptive screen EMA
+  - Strict gesture priority chain (clean if/elif)
+  - In-frame ✕ / — buttons (setMouseCallback + wmctrl)
+  - Single-hand enforcement: detection/presence confidence raised to 0.70/0.70
+  - Performance: Popen fire-and-forget, 20 fps cap, rolling FPS EMA
+  - Hand visibility warning: directional arrow when index tip enters outer 15% of frame
+  - Smooth re-entry: no cursor jump on hand return (state reset on first frame back)
 
 Config is read from kontrol.conf (INI format) in the same directory.
 If kontrol.conf is missing it is created with default values.
-All tuning knobs live in kontrol.conf — no need to edit this file.
 
+In-frame controls: click ✕ (top-right) to quit, — to minimize active window.
 Press Q in preview window to quit.
 """
 
@@ -35,7 +44,7 @@ import configparser
 from collections import deque
 from pathlib import Path
 
-# ── Config file ───────────────────────────────────────────────────────────────
+# ── Config ────────────────────────────────────────────────────────────────────
 CONF_PATH  = Path(__file__).parent / "kontrol.conf"
 MODEL_PATH = Path(__file__).parent / "hand_landmarker.task"
 
@@ -48,84 +57,98 @@ _DEFAULTS = {
         "id":   "0",
         "flip": "true",
     },
+    "mapping": {
+        # Active zone in camera-normalized [0,1] space.
+        # Hand must stay inside this rectangle; it maps to the full screen.
+        "zone_x_min": "0.15",
+        "zone_x_max": "0.85",
+        "zone_y_min": "0.10",
+        "zone_y_max": "0.90",
+        # Velocity multiplier applied when the mapped cursor is within 10% of a
+        # screen edge — lets the user snap to corners without leaving the zone.
+        "edge_boost": "1.8",
+    },
     "smoothing": {
-        # Velocity-adaptive EMA: factor = clamp(vel_norm * scale, min, max)
-        # vel_norm = pixel_delta / screen_diagonal  (0..~0.15 for typical hand motion)
-        "min_smooth":        "0.05",
-        "max_smooth":        "0.22",
-        "velocity_scale":    "1.5",
-        "cursor_deadzone_px": "2",   # skip moves smaller than this to absorb landmark jitter
+        # Stage 1 — fixed-alpha pre-filter applied directly to the raw landmark
+        # before zone mapping.  Removes per-frame detector jitter.
+        "landmark_smooth":    "0.4",
+        # Stage 2 — velocity-adaptive screen-space EMA.
+        # smooth = clamp(vel_norm * velocity_scale * boost, min_smooth, max_smooth)
+        "min_smooth":         "0.05",
+        "max_smooth":         "0.18",
+        "velocity_scale":     "2.0",
+        "cursor_deadzone_px": "2",     # skip moves ≤ this to kill residual jitter
     },
     "gestures": {
-        "pinch_threshold":    "0.05",   # normalized landmark distance → click
-        "pinch_cooldown":     "0.4",    # seconds between clicks (per button)
-        "scroll_deadzone":    "0.012",  # min norm y-delta per frame before scrolling
-        "scroll_speed":       "8.0",    # ticks = max(1, int(abs(dy) * scroll_speed))
-        "flick_min_velocity": "2.0",    # normalized units/s wrist velocity (0-1 screen space)
-        "flick_window_ms":    "120",    # ms window for velocity measurement
-        "flick_axis_ratio":   "3.0",    # dominant/minor axis ratio — filters diagonal cursor sweeps
-        "flick_cooldown":     "0.8",    # seconds between consecutive tiling gestures
-        "fist_minimize_frames": "6",    # medium fist hold: minimize current window
-        "fist_lock_frames":     "12",   # long fist hold: toggle tracking lock
-        "taskview_hold_frames": "8",    # frames wrist-rotated before task view fires
-        "taskview_cooldown":    "1.5",  # seconds between task view triggers
+        "pinch_threshold":      "0.05",
+        "pinch_cooldown":       "0.4",
+        "scroll_deadzone":      "0.012",
+        "scroll_speed":         "8.0",
+        "flick_min_velocity":   "2.0",   # norm/s in [0,1]² space
+        "flick_window_ms":      "120",
+        "flick_axis_ratio":     "3.0",   # dom/minor — filters diagonal cursor sweeps
+        "flick_cooldown":       "0.8",
+        "fist_minimize_frames": "6",
+        "fist_lock_frames":     "12",
+        "taskview_hold_frames": "8",
+        "taskview_cooldown":    "1.5",
     },
     "system": {
         "ydotool_socket": "/run/user/1000/.ydotool_socket",
-        "abs_scale_x":    "1.0",   # set to 32767/1920 if cursor maps to wrong spot
+        "abs_scale_x":    "1.0",
         "abs_scale_y":    "1.0",
     },
 }
 
 
 def load_config() -> configparser.ConfigParser:
-    """
-    Load kontrol.conf, overlaying user values on top of built-in defaults.
-    If the file does not exist, write the defaults and return them.
-    """
     cfg = configparser.ConfigParser()
-    cfg.read_dict(_DEFAULTS)        # populate defaults first
+    cfg.read_dict(_DEFAULTS)
     if not CONF_PATH.exists():
         with open(CONF_PATH, "w") as f:
             cfg.write(f)
         print(f"[kontrol] Created default config: {CONF_PATH}")
     else:
-        cfg.read(CONF_PATH)         # overlay user values
+        cfg.read(CONF_PATH)
     return cfg
 
 
 _cfg = load_config()
 
-SCREEN_W         = _cfg.getint("screen",    "width")
-SCREEN_H         = _cfg.getint("screen",    "height")
-CAM_ID           = _cfg.getint("camera",    "id")
-FLIP             = _cfg.getboolean("camera","flip")
-MIN_SMOOTH       = _cfg.getfloat("smoothing", "min_smooth")
-MAX_SMOOTH       = _cfg.getfloat("smoothing", "max_smooth")
-VELOCITY_SCALE      = _cfg.getfloat("smoothing", "velocity_scale")
-CURSOR_DEADZONE_PX  = _cfg.getint("smoothing",  "cursor_deadzone_px")
-PINCH_THRESHOLD  = _cfg.getfloat("gestures", "pinch_threshold")
-PINCH_COOLDOWN   = _cfg.getfloat("gestures", "pinch_cooldown")
-SCROLL_DEADZONE  = _cfg.getfloat("gestures", "scroll_deadzone")
-SCROLL_SPEED     = _cfg.getfloat("gestures", "scroll_speed")
-FLICK_MIN_VEL    = _cfg.getfloat("gestures", "flick_min_velocity")
-FLICK_WINDOW_MS  = _cfg.getfloat("gestures", "flick_window_ms")
-FLICK_AXIS_RATIO     = _cfg.getfloat("gestures", "flick_axis_ratio")
-FLICK_COOLDOWN       = _cfg.getfloat("gestures", "flick_cooldown")
+SCREEN_W           = _cfg.getint("screen",    "width")
+SCREEN_H           = _cfg.getint("screen",    "height")
+CAM_ID             = _cfg.getint("camera",    "id")
+FLIP               = _cfg.getboolean("camera","flip")
+ZONE_X_MIN         = _cfg.getfloat("mapping", "zone_x_min")
+ZONE_X_MAX         = _cfg.getfloat("mapping", "zone_x_max")
+ZONE_Y_MIN         = _cfg.getfloat("mapping", "zone_y_min")
+ZONE_Y_MAX         = _cfg.getfloat("mapping", "zone_y_max")
+EDGE_BOOST         = _cfg.getfloat("mapping", "edge_boost")
+LANDMARK_SMOOTH    = _cfg.getfloat("smoothing", "landmark_smooth")
+MIN_SMOOTH         = _cfg.getfloat("smoothing", "min_smooth")
+MAX_SMOOTH         = _cfg.getfloat("smoothing", "max_smooth")
+VELOCITY_SCALE     = _cfg.getfloat("smoothing", "velocity_scale")
+CURSOR_DEADZONE_PX = _cfg.getint("smoothing",  "cursor_deadzone_px")
+PINCH_THRESHOLD    = _cfg.getfloat("gestures", "pinch_threshold")
+PINCH_COOLDOWN     = _cfg.getfloat("gestures", "pinch_cooldown")
+SCROLL_DEADZONE    = _cfg.getfloat("gestures", "scroll_deadzone")
+SCROLL_SPEED       = _cfg.getfloat("gestures", "scroll_speed")
+FLICK_MIN_VEL      = _cfg.getfloat("gestures", "flick_min_velocity")
+FLICK_WINDOW_MS    = _cfg.getfloat("gestures", "flick_window_ms")
+FLICK_AXIS_RATIO   = _cfg.getfloat("gestures", "flick_axis_ratio")
+FLICK_COOLDOWN     = _cfg.getfloat("gestures", "flick_cooldown")
 FIST_MINIMIZE_FRAMES = _cfg.getint("gestures",  "fist_minimize_frames")
 FIST_LOCK_FRAMES     = _cfg.getint("gestures",  "fist_lock_frames")
 TASKVIEW_HOLD_FRAMES = _cfg.getint("gestures",  "taskview_hold_frames")
 TASKVIEW_COOLDOWN    = _cfg.getfloat("gestures","taskview_cooldown")
 YDOTOOL_SOCKET       = _cfg.get("system",       "ydotool_socket")
-ABS_SCALE_X      = _cfg.getfloat("system",   "abs_scale_x")
-ABS_SCALE_Y      = _cfg.getfloat("system",   "abs_scale_y")
+ABS_SCALE_X        = _cfg.getfloat("system",   "abs_scale_x")
+ABS_SCALE_Y        = _cfg.getfloat("system",   "abs_scale_y")
 
 SCREEN_DIAG = math.hypot(SCREEN_W, SCREEN_H)
-# ─────────────────────────────────────────────────────────────────────────────
 
-# Raw Linux keycodes for KDE tiling shortcuts (input-event-codes.h).
+# Raw Linux keycodes (input-event-codes.h).
 # KEY_LEFTMETA=125, KEY_LEFT=105, KEY_RIGHT=106, KEY_UP=103, KEY_DOWN=108
-# ydotool key requires raw keycodes — NOT X11 keysym strings.
 _TILING_KEYS = {
     "right": ("125:1", "106:1", "106:0", "125:0"),
     "left":  ("125:1", "105:1", "105:0", "125:0"),
@@ -135,41 +158,52 @@ _TILING_KEYS = {
 
 os.environ["YDOTOOL_SOCKET"] = YDOTOOL_SOCKET
 
-BaseOptions           = mp.tasks.BaseOptions
-HandLandmarker        = mp.tasks.vision.HandLandmarker
-HandLandmarkerOptions = mp.tasks.vision.HandLandmarkerOptions
-RunningMode           = mp.tasks.vision.RunningMode
+BaseOptions              = mp.tasks.BaseOptions
+HandLandmarker           = mp.tasks.vision.HandLandmarker
+HandLandmarkerOptions    = mp.tasks.vision.HandLandmarkerOptions
+RunningMode              = mp.tasks.vision.RunningMode
 HandLandmarksConnections = mp.tasks.vision.HandLandmarksConnections
 
 
+def _clamp(v: float, lo: float, hi: float) -> float:
+    return lo if v < lo else (hi if v > hi else v)
+
+
 # ── ydotool helpers ───────────────────────────────────────────────────────────
-def ydocall(*args):
-    subprocess.run(
-        ["ydotool", *[str(a) for a in args]],
-        env=os.environ,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
+def ydocall(*args, blocking: bool = False):
+    """
+    Issue a ydotool command.
+    blocking=False (default) — Popen, fire-and-forget (cursor/click calls).
+    blocking=True            — subprocess.run, wait for completion (key sequences).
+    """
+    cmd = ["ydotool", *[str(a) for a in args]]
+    if blocking:
+        subprocess.run(cmd, env=os.environ,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    else:
+        subprocess.Popen(cmd, env=os.environ,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
 
 def move_cursor(dx: int, dy: int):
     """Send relative mouse delta. ydotoold has no EV_ABS — only REL works."""
     ydocall("mousemove", "-x", dx, "-y", dy)
 
-def mouse_down():    ydocall("click", "0x40")   # left button press (hold for drag)
-def mouse_up():      ydocall("click", "0x80")   # left button release
-def left_click():    ydocall("click", "0xC0")   # left press + release (atomic, kept for ref)
-def right_click():   ydocall("click", "0xC1")
+def mouse_down():   ydocall("click", "0x40")
+def mouse_up():     ydocall("click", "0x80")
+def left_click():   ydocall("click", "0xC0")
+def right_click():  ydocall("click", "0xC1")
 
 def scroll_up(ticks: int = 1):
-    ydocall("mousemove", "--wheel", "-y", str(-ticks))
+    ydocall("mousemove", "--wheel", "-x", "0", "-y", str(-ticks))
 
 def scroll_down(ticks: int = 1):
-    ydocall("mousemove", "--wheel", "-y", str(ticks))
+    ydocall("mousemove", "--wheel", "-x", "0", "-y", str(ticks))
 
 def tiling_key(direction: str):
     seq = _TILING_KEYS.get(direction)
     if seq:
-        ydocall("key", *seq)
+        ydocall("key", *seq, blocking=True)
 
 
 # ── Landmark math ─────────────────────────────────────────────────────────────
@@ -177,24 +211,24 @@ def pinch_dist(lm, a: int, b: int) -> float:
     return math.hypot(lm[a].x - lm[b].x, lm[a].y - lm[b].y)
 
 def is_finger_extended(lm, tip: int, pip: int) -> bool:
-    """Fingertip above PIP joint = extended (y increases downward in MediaPipe)."""
+    """Tip above PIP = extended (MediaPipe y increases downward)."""
     return lm[tip].y < lm[pip].y
 
 def is_scroll_pose(lm) -> bool:
-    """Index + middle extended above PIP; ring + pinky curled."""
+    """Index + middle extended; ring + pinky curled below their MCP joint."""
     return (is_finger_extended(lm, 8,  6)  and
             is_finger_extended(lm, 12, 10) and
-            not is_finger_extended(lm, 16, 14) and
-            not is_finger_extended(lm, 20, 18))
+            not is_finger_extended(lm, 16, 13) and   # ring tip vs ring MCP (more lenient than PIP)
+            not is_finger_extended(lm, 20, 17))      # pinky tip vs pinky MCP
 
 def is_fist(lm) -> bool:
-    """All 4 fingertip y-coords exceed their MCP joints (fully curled)."""
+    """All four fingertips below their MCP joints."""
     tips = [8, 12, 16, 20]
     mcps = [5,  9, 13, 17]
     return all(lm[t].y > lm[m].y for t, m in zip(tips, mcps))
 
 def is_wrist_rotated(lm) -> bool:
-    """Hand flipped so fingers point down: middle fingertip (LM 12) y > wrist (LM 0) y by margin."""
+    """Hand flipped so fingers point down: LM12.y > LM0.y + 0.10."""
     return lm[12].y > lm[0].y + 0.10
 
 
@@ -203,15 +237,11 @@ def check_flick(history: deque) -> str | None:
     Measure wrist (LM 0) velocity over the last FLICK_WINDOW_MS milliseconds.
     Returns dominant-axis direction string or None.
 
-    Two-condition gate to suppress false fires from fast cursor movement.
-    History stores normalized (0-1) coordinates to avoid screen-aspect distortion
-    (4480:1440 pixel space would make 45° diagonals look axis-pure in pixels).
-
-      1. Speed in normalized units/s must exceed FLICK_MIN_VEL.
-         Normal wrist movement during cursor control: ~0.3-1.5 norm/s.
-         Deliberate full-wrist flick: ~2.5-5.0 norm/s.
+    Two gates suppress false fires from fast cursor sweeps:
+      1. Speed > FLICK_MIN_VEL normalized units/s.
       2. Motion must be axis-pure: dominant/minor >= FLICK_AXIS_RATIO.
-         Normal cursor movement is multi-directional; a real flick is straight.
+    History is stored in normalized [0,1] coords to avoid 4480:1440
+    aspect-ratio distortion skewing the axis-purity test.
     """
     if len(history) < 2:
         return None
@@ -224,10 +254,9 @@ def check_flick(history: deque) -> str | None:
     dt = t_now - t0
     if dt < 0.001:
         return None
-    vx, vy = (x_now - x0) / dt, (y_now - y0) / dt   # in normalized/s
+    vx, vy = (x_now - x0) / dt, (y_now - y0) / dt
     if math.hypot(vx, vy) < FLICK_MIN_VEL:
         return None
-    # Axis purity in normalized space: filters diagonal cursor sweeps
     dom   = max(abs(vx), abs(vy))
     minor = min(abs(vx), abs(vy))
     if minor > 0 and dom / minor < FLICK_AXIS_RATIO:
@@ -237,21 +266,24 @@ def check_flick(history: deque) -> str | None:
 
 # ── Startup sound ─────────────────────────────────────────────────────────────
 def play_startup_sound():
-    """880 Hz double-beep via aplay. stdlib only — no extra deps."""
-    rate, freq, amp = 22050, 880, 28000
-    dur, gap = 0.12, 0.04
+    """Triple ascending tone — 880 → 1047 → 1319 Hz (v0.5 signature, vs v0.4 double-beep)."""
+    rate, amp       = 22050, 28000
+    dur, gap        = 0.10, 0.04
+    freqs           = (880, 1047, 1319)
 
-    def burst(duration: float) -> bytes:
-        n = int(rate * duration)
+    def burst(frequency: float, duration: float) -> bytes:
+        n   = int(rate * duration)
         out = bytearray(n * 2)
         for i in range(n):
-            t = i / rate
+            t   = i / rate
             env = min(t / (duration * 0.1), 1.0, (duration - t) / (duration * 0.1))
             struct.pack_into("<h", out, i * 2,
-                             int(amp * env * math.sin(2.0 * math.pi * freq * t)))
+                             int(amp * env * math.sin(2.0 * math.pi * frequency * t)))
         return bytes(out)
 
-    pcm = burst(dur) + bytes(int(rate * gap) * 2) + burst(dur)
+    silence = bytes(int(rate * gap) * 2)
+    pcm     = silence.join(burst(f, dur) for f in freqs)
+
     tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
     with wave.open(tmp.name, "wb") as wf:
         wf.setnchannels(1);  wf.setsampwidth(2);  wf.setframerate(rate)
@@ -259,6 +291,46 @@ def play_startup_sound():
     tmp.close()
     subprocess.Popen(["aplay", "-q", tmp.name],
                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+# ── In-frame button state ─────────────────────────────────────────────────────
+_quit_flag              = [False]
+_btn_close: tuple | None = None   # (x1, y1, x2, y2) in frame pixels
+_btn_min:   tuple | None = None
+
+
+def _mouse_cb(event, x, y, flags, param):
+    """OpenCV mouse callback — handles ✕ (quit) and — (minimize) buttons."""
+    if event != cv2.EVENT_LBUTTONDOWN:
+        return
+    if _btn_close and _btn_close[0] <= x <= _btn_close[2] and _btn_close[1] <= y <= _btn_close[3]:
+        _quit_flag[0] = True
+    elif _btn_min and _btn_min[0] <= x <= _btn_min[2] and _btn_min[1] <= y <= _btn_min[3]:
+        subprocess.Popen(
+            ["wmctrl", "-r", ":ACTIVE:", "-b", "add,hidden"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+
+
+def draw_buttons(frame):
+    """Draw ✕ and — buttons top-right of frame; update _btn_close / _btn_min rects."""
+    global _btn_close, _btn_min
+    h, w = frame.shape[:2]
+    pad, bw, bh = 5, 24, 18
+    # Close ✕
+    cx1, cy1, cx2, cy2 = w - pad - bw, pad, w - pad, pad + bh
+    _btn_close = (cx1, cy1, cx2, cy2)
+    cv2.rectangle(frame, (cx1, cy1), (cx2, cy2), (40, 40, 160), -1)
+    cv2.rectangle(frame, (cx1, cy1), (cx2, cy2), (160, 160, 160), 1)
+    cv2.putText(frame, "X", (cx1 + 6, cy2 - 3),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (220, 220, 220), 1)
+    # Minimize —
+    mx1, my1, mx2, my2 = cx1 - pad - bw, pad, cx1 - pad, pad + bh
+    _btn_min = (mx1, my1, mx2, my2)
+    cv2.rectangle(frame, (mx1, my1), (mx2, my2), (30, 100, 30), -1)
+    cv2.rectangle(frame, (mx1, my1), (mx2, my2), (160, 160, 160), 1)
+    cv2.putText(frame, "-", (mx1 + 8, my2 - 3),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (220, 220, 220), 1)
 
 
 # ── Drawing helpers ───────────────────────────────────────────────────────────
@@ -269,6 +341,27 @@ def draw_skeleton(frame, lm, fw: int, fh: int):
         cv2.line(frame, (ax, ay), (bx, by), (60, 160, 60), 1)
     for lmk in lm:
         cv2.circle(frame, (int(lmk.x * fw), int(lmk.y * fh)), 3, (100, 200, 100), -1)
+
+
+def draw_visibility_warning(frame, lm, fw: int, fh: int):
+    """
+    Draws a directional arrow toward the frame centre when the index tip
+    enters the outer 15% of the camera frame.  Cues the user to move
+    their hand back into the active tracking zone.
+    """
+    x, y  = lm[8].x, lm[8].y
+    OUTER = 0.15
+    if not (x < OUTER or x > 1.0 - OUTER or y < OUTER or y > 1.0 - OUTER):
+        return
+    px,  py  = int(x * fw), int(y * fh)
+    cfx, cfy = fw // 2, fh // 2
+    vx,  vy  = cfx - px, cfy - py
+    mag      = math.hypot(vx, vy) or 1.0
+    tip_x    = int(px + vx / mag * 45)
+    tip_y    = int(py + vy / mag * 45)
+    cv2.arrowedLine(frame, (px, py), (tip_x, tip_y), (0, 80, 255), 2, tipLength=0.35)
+    cv2.putText(frame, "MOVE IN", (max(px - 28, 2), max(py - 8, 10)),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.38, (0, 80, 255), 1)
 
 
 def draw_hud(frame, locked: bool, gesture: str, fps: float,
@@ -283,7 +376,6 @@ def draw_hud(frame, locked: bool, gesture: str, fps: float,
     cv2.putText(frame, mode_txt, (w // 2 - 58, h - 14),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.8, border_color, 2)
 
-    # ── standard HUD lines ────────────────────────────────────────────────────
     for i, txt in enumerate([
         f"FPS     {fps:5.1f}",
         f"Mode    {mode_txt}",
@@ -294,7 +386,6 @@ def draw_hud(frame, locked: bool, gesture: str, fps: float,
         cv2.putText(frame, txt, (8, 18 + i * 18),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.45, (210, 210, 210), 1)
 
-    # ── fist hold progress bar ────────────────────────────────────────────────
     if fist_count > 0:
         BAR_BLOCKS = 12
         filled  = min(fist_count, BAR_BLOCKS)
@@ -303,7 +394,6 @@ def draw_hud(frame, locked: bool, gesture: str, fps: float,
         cv2.putText(frame, bar_txt, (8, 18 + 5 * 18),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.40, (80, 200, 255), 1)
 
-    # ── flash overlays ────────────────────────────────────────────────────────
     if flash_taskview:
         cv2.putText(frame, "TASK VIEW", (w // 2 - 90, h // 2),
                     cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 200), 3)
@@ -313,6 +403,10 @@ def draw_hud(frame, locked: bool, gesture: str, fps: float,
 
 
 # ── Main loop ─────────────────────────────────────────────────────────────────
+TARGET_FPS     = 20
+FRAME_INTERVAL = 1.0 / TARGET_FPS
+
+
 def run():
     if not MODEL_PATH.exists():
         raise FileNotFoundError(
@@ -327,20 +421,18 @@ def run():
         running_mode=RunningMode.IMAGE,
         num_hands=1,
         min_hand_detection_confidence=0.70,
-        min_hand_presence_confidence=0.60,
+        min_hand_presence_confidence=0.70,
         min_tracking_confidence=0.60,
     )
 
     cap = cv2.VideoCapture(CAM_ID, cv2.CAP_V4L2)
-    # MJPG: camera compresses before USB transfer — required for C920 on USB2
     cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
     cap.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
     cap.set(cv2.CAP_PROP_FPS,          30)
 
     # Re-apply v4l2 tuning AFTER VideoCapture opens the device.
-    # cv2.VideoCapture() resets UVC controls to driver defaults on open,
-    # so cam-tune.sh must run here, not in run.sh before Python starts.
+    # cv2.VideoCapture() resets UVC controls to driver defaults on open.
     _tune = Path(__file__).parent / "cam-tune.sh"
     if _tune.exists():
         subprocess.run(["bash", str(_tune)],
@@ -348,47 +440,64 @@ def run():
 
     play_startup_sound()
 
-    cx, cy           = float(SCREEN_W) / 2, float(SCREEN_H) / 2
-    prev_tx, prev_ty = cx, cy
-    # Relative movement: track what integer position was last sent so we
-    # compute correct deltas each frame. Floats so sub-pixel accumulates.
-    prev_sent_x, prev_sent_y = cx, cy
-    drag_active   = False;  last_drag_end_t = 0.0   # left button held = drag/click
-    pinch_held_R  = False;  last_click_R = 0.0
-    scroll_ref_y  = None
-    wrist_history = deque(maxlen=30)
-    last_flick_t  = 0.0
+    win_name = "Kontrol v0.5"
+    cv2.namedWindow(win_name)
+    cv2.setMouseCallback(win_name, _mouse_cb)
 
+    # ── Cursor state ──────────────────────────────────────────────────────────
+    cx, cy               = float(SCREEN_W) / 2, float(SCREEN_H) / 2
+    prev_tx, prev_ty     = cx, cy
+    prev_sent_x, prev_sent_y = cx, cy
+    # Stage 1 EMA accumulators — initialize to centre of camera frame
+    raw_x_smooth: float  = 0.5
+    raw_y_smooth: float  = 0.5
+
+    # ── Gesture state ─────────────────────────────────────────────────────────
+    drag_active            = False;  last_drag_end_t    = 0.0
+    pinch_held_R           = False;  last_click_R       = 0.0
+    scroll_ref_y: float | None = None
+    wrist_history          = deque(maxlen=30)
+    last_flick_t           = 0.0
     locked                 = False
     fist_hold_count        = 0
     fist_toggled_this_hold = False
+    taskview_hold_count    = 0
+    last_taskview_t        = 0.0
+    taskview_flash_until   = 0.0
+    minimize_flash_until   = 0.0
+    hand_was_present       = False   # re-entry guard — prevents cursor jump
 
-    taskview_hold_count = 0
-    last_taskview_t     = 0.0
-    taskview_flash_until = 0.0
-    minimize_flash_until = 0.0
-
+    # ── HUD / performance state ───────────────────────────────────────────────
     active_gesture = "NONE"
     pd_L_hud = pd_R_hud = 1.0
-    fps = 0.0;  frame_count = 0;  fps_timer = time.time()
+    fps          = 0.0
+    fps_alpha    = 0.1          # rolling EMA smoothing for FPS display
+    last_frame_t = time.time()
 
-    print(f"Kontrol v0.3  {SCREEN_W}x{SCREEN_H}"
+    print(f"Kontrol v0.5  {SCREEN_W}x{SCREEN_H}"
+          f"  zone=[{ZONE_X_MIN:.2f}-{ZONE_X_MAX:.2f}, {ZONE_Y_MIN:.2f}-{ZONE_Y_MAX:.2f}]"
+          f"  lm_smooth={LANDMARK_SMOOTH}"
           f"  smooth[{MIN_SMOOTH}-{MAX_SMOOTH}]x{VELOCITY_SCALE}"
+          f"  edge_boost={EDGE_BOOST}"
           f"  pinch={PINCH_THRESHOLD}  config={CONF_PATH.name}")
     print(f"  Fist {FIST_MINIMIZE_FRAMES}fr=minimize  {FIST_LOCK_FRAMES}fr=lock"
           f"  WristRotate {TASKVIEW_HOLD_FRAMES}fr=taskview   Q=quit")
 
     with HandLandmarker.create_from_options(opts) as detector:
         while cap.isOpened():
+            frame_start = time.time()
+
             ok, frame = cap.read()
             if not ok:
                 continue
 
             now = time.time()
-            frame_count += 1
-            if now - fps_timer >= 1.0:
-                fps = frame_count / (now - fps_timer)
-                frame_count = 0;  fps_timer = now
+
+            # Rolling FPS EMA
+            dt = now - last_frame_t
+            last_frame_t = now
+            if dt > 0:
+                fps = fps * (1.0 - fps_alpha) + (1.0 / dt) * fps_alpha
 
             if FLIP:
                 frame = cv2.flip(frame, 1)
@@ -401,45 +510,72 @@ def run():
             if result.hand_landmarks:
                 lm = result.hand_landmarks[0]
 
-                wrist_history.append((now,
-                                      lm[0].x,   # normalized 0-1 (no screen scaling)
-                                      lm[0].y))
+                # ── Re-entry: reset state on first frame after hand absence ───
+                if not hand_was_present:
+                    raw_x_smooth = lm[8].x
+                    raw_y_smooth = lm[8].y
+                    nx0 = _clamp((raw_x_smooth - ZONE_X_MIN) / (ZONE_X_MAX - ZONE_X_MIN), 0.0, 1.0)
+                    ny0 = _clamp((raw_y_smooth - ZONE_Y_MIN) / (ZONE_Y_MAX - ZONE_Y_MIN), 0.0, 1.0)
+                    cx, cy             = nx0 * SCREEN_W, ny0 * SCREEN_H
+                    prev_tx, prev_ty   = cx, cy
+                    prev_sent_x, prev_sent_y = cx, cy
+                hand_was_present = True
+
+                wrist_history.append((now, lm[0].x, lm[0].y))   # normalized coords
 
                 pd_L_hud = pinch_dist(lm, 4, 8)
                 pd_R_hud = pinch_dist(lm, 4, 16)
 
-                # ── Fist: tiered hold (runs regardless of lock state) ─────────
+                # ── Priority 1: Fist — tiered hold (bypasses lock) ────────────
                 fist_now = is_fist(lm)
                 if fist_now:
                     fist_hold_count += 1
-                    # Long hold → toggle lock immediately (don't wait for release)
                     if fist_hold_count >= FIST_LOCK_FRAMES and not fist_toggled_this_hold:
-                        if drag_active:          # never leave a button stuck down
+                        if drag_active:
                             mouse_up()
                             drag_active = False
                         locked = not locked
                         fist_toggled_this_hold = True
                 else:
-                    # Fist released — check for medium hold → minimize
+                    # Released — check for medium hold (minimize)
                     if (FIST_MINIMIZE_FRAMES <= fist_hold_count < FIST_LOCK_FRAMES
                             and not fist_toggled_this_hold
                             and not locked):
-                        # Meta+Down — minimizes floating window, restores tiled (acceptable)
-                        ydocall("key", "125:1", "109:1", "109:0", "125:0")
+                        # wmctrl is the reliable cross-setup approach for iconify;
+                        # KDE has no guaranteed global minimize keybind by default.
+                        subprocess.Popen(
+                            ["wmctrl", "-r", ":ACTIVE:", "-b", "add,hidden"],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                        )
                         minimize_flash_until = now + 0.5
                         active_gesture = "MINIMIZE"
-                    fist_hold_count = 0
+                    fist_hold_count        = 0
                     fist_toggled_this_hold = False
 
-                # ── Locked mode ───────────────────────────────────────────────
+                # ── Priority 2: Lock ──────────────────────────────────────────
                 if locked:
                     active_gesture = "FIST-LOCKED" if fist_now else "LOCKED"
 
-                # ── Fist held but not yet locked — show progress, skip gestures
+                # ── Fist in progress (not yet locked) ─────────────────────────
                 elif fist_now:
                     active_gesture = f"FIST {fist_hold_count}/{FIST_LOCK_FRAMES}"
 
-                # ── Active gesture dispatch ───────────────────────────────────
+                # ── Priority 3: Wrist rotate → task overview ──────────────────
+                elif is_wrist_rotated(lm):
+                    scroll_ref_y = None
+                    if drag_active:
+                        mouse_up(); drag_active = False
+                    taskview_hold_count += 1
+                    if (taskview_hold_count >= TASKVIEW_HOLD_FRAMES
+                            and (now - last_taskview_t) > TASKVIEW_COOLDOWN):
+                        # Meta+PgUp (KEY_PAGEUP=104)
+                        ydocall("key", "125:1", "104:1", "104:0", "125:0", blocking=True)
+                        last_taskview_t     = now
+                        taskview_flash_until = now + 1.0
+                        taskview_hold_count = 0
+                    active_gesture = f"ROTATE {taskview_hold_count}/{TASKVIEW_HOLD_FRAMES}"
+
+                # ── Priority 4: Scroll ────────────────────────────────────────
                 elif is_scroll_pose(lm):
                     taskview_hold_count = 0
                     if drag_active:
@@ -448,11 +584,11 @@ def run():
                     if scroll_ref_y is None:
                         scroll_ref_y = cur_y
                     else:
-                        dy = cur_y - scroll_ref_y
+                        dy_s = cur_y - scroll_ref_y
                         scroll_ref_y = cur_y
-                        if abs(dy) > SCROLL_DEADZONE:
-                            ticks = max(1, int(abs(dy) * SCROLL_SPEED))
-                            if dy < 0:
+                        if abs(dy_s) > SCROLL_DEADZONE:
+                            ticks = max(1, int(abs(dy_s) * SCROLL_SPEED))
+                            if dy_s < 0:
                                 scroll_up(ticks)
                                 active_gesture = f"SCROLL UP x{ticks}"
                             else:
@@ -462,46 +598,46 @@ def run():
                             active_gesture = "SCROLL"
 
                     for lm_idx in [8, 12]:
-                        px = (int(lm[lm_idx].x * fw_px), int(lm[lm_idx].y * fh_px))
-                        cv2.circle(frame, px, 14, (0, 200, 255), -1)
-                        cv2.circle(frame, px, 14, (255, 255, 255), 2)
+                        spx = (int(lm[lm_idx].x * fw_px), int(lm[lm_idx].y * fh_px))
+                        cv2.circle(frame, spx, 14, (0, 200, 255), -1)
+                        cv2.circle(frame, spx, 14, (255, 255, 255), 2)
 
-                elif is_wrist_rotated(lm):
-                    # Wrist rotate: fingers pointing down → KDE task overview
-                    scroll_ref_y = None
-                    if drag_active:
-                        mouse_up(); drag_active = False
-                    taskview_hold_count += 1
-                    if (taskview_hold_count >= TASKVIEW_HOLD_FRAMES
-                            and (now - last_taskview_t) > TASKVIEW_COOLDOWN):
-                        # Meta+PgUp (KEY_LEFTMETA=125, KEY_PAGEUP=104)
-                        ydocall("key", "125:1", "104:1", "104:0", "125:0")
-                        # Alt: Meta+W  ydocall("key", "125:1", "17:1", "17:0", "125:0")
-                        last_taskview_t = now
-                        taskview_flash_until = now + 1.0
-                        taskview_hold_count = 0
-                    active_gesture = f"ROTATE {taskview_hold_count}/{TASKVIEW_HOLD_FRAMES}"
-
+                # ── Priority 5-8: Flick / right-click / drag / cursor ─────────
                 else:
-                    scroll_ref_y = None
+                    scroll_ref_y        = None
                     taskview_hold_count = 0
 
+                    # Priority 5: Flick — cursor does NOT move during flick
                     flick = check_flick(wrist_history)
                     if flick and (now - last_flick_t) > FLICK_COOLDOWN:
                         tiling_key(flick)
-                        last_flick_t = now
+                        last_flick_t   = now
                         active_gesture = f"FLICK {flick.upper()}"
                         wrist_history.clear()
-                    else:
-                        tx = lm[8].x * SCREEN_W
-                        ty = lm[8].y * SCREEN_H
 
+                    else:
+                        # ── Double EMA cursor tracking ────────────────────────
+                        # Stage 1: fixed-alpha pre-filter on raw landmark
+                        raw_x_smooth = raw_x_smooth * (1.0 - LANDMARK_SMOOTH) + lm[8].x * LANDMARK_SMOOTH
+                        raw_y_smooth = raw_y_smooth * (1.0 - LANDMARK_SMOOTH) + lm[8].y * LANDMARK_SMOOTH
+
+                        # Zone mapping: [zone_min, zone_max] → [0, 1] → screen pixels
+                        nx = _clamp((raw_x_smooth - ZONE_X_MIN) / (ZONE_X_MAX - ZONE_X_MIN), 0.0, 1.0)
+                        ny = _clamp((raw_y_smooth - ZONE_Y_MIN) / (ZONE_Y_MAX - ZONE_Y_MIN), 0.0, 1.0)
+                        tx = nx * SCREEN_W
+                        ty = ny * SCREEN_H
+
+                        # Edge boost: snappier when cursor is near screen edge
+                        near_edge = nx < 0.1 or nx > 0.9 or ny < 0.1 or ny > 0.9
+                        boost     = EDGE_BOOST if near_edge else 1.0
+
+                        # Stage 2: velocity-adaptive screen-space EMA
                         vel_norm = math.hypot(tx - prev_tx, ty - prev_ty) / SCREEN_DIAG
-                        smooth   = max(MIN_SMOOTH, min(MAX_SMOOTH,
-                                                       vel_norm * VELOCITY_SCALE))
+                        smooth   = _clamp(vel_norm * VELOCITY_SCALE * boost, MIN_SMOOTH, MAX_SMOOTH)
                         cx = cx * (1.0 - smooth) + tx * smooth
                         cy = cy * (1.0 - smooth) + ty * smooth
                         prev_tx, prev_ty = tx, ty
+
                         dx = round(cx - prev_sent_x)
                         dy = round(cy - prev_sent_y)
                         if max(abs(dx), abs(dy)) >= CURSOR_DEADZONE_PX:
@@ -509,20 +645,20 @@ def run():
                             prev_sent_x += dx
                             prev_sent_y += dy
 
-                        # ── Right click (ring+thumb) ──────────────────────────
+                        # Priority 6: Right click (ring + thumb)
                         if pd_R_hud < PINCH_THRESHOLD:
                             if not pinch_held_R and (now - last_click_R) > PINCH_COOLDOWN:
-                                if drag_active:      # cancel drag before right-clicking
+                                if drag_active:
                                     mouse_up(); drag_active = False
                                 right_click(); last_click_R = now
-                            pinch_held_R = True
+                            pinch_held_R   = True
                             active_gesture = f"R-CLICK d={pd_R_hud:.3f}"
                         else:
                             pinch_held_R = False
 
-                        # ── Left pinch: hold = drag, release = click/drop ─────
-                        left_pinched = pd_L_hud < PINCH_THRESHOLD and \
-                                       not (pd_R_hud < PINCH_THRESHOLD)
+                        # Priority 7-8: Left pinch — hold = drag, tap = click
+                        left_pinched = (pd_L_hud < PINCH_THRESHOLD and
+                                        not (pd_R_hud < PINCH_THRESHOLD))
                         if left_pinched:
                             if not drag_active:
                                 if (now - last_drag_end_t) > PINCH_COOLDOWN:
@@ -533,19 +669,23 @@ def run():
                         else:
                             if drag_active:
                                 mouse_up()
-                                drag_active   = False
+                                drag_active     = False
                                 last_drag_end_t = now
-                                wrist_history.clear()   # don't let drag momentum look like a flick
+                                wrist_history.clear()   # prevent drag momentum triggering flick
                             elif not (pd_R_hud < PINCH_THRESHOLD):
                                 active_gesture = "CURSOR"
 
                 draw_skeleton(frame, lm, fw_px, fh_px)
+                draw_visibility_warning(frame, lm, fw_px, fh_px)
+
             else:
-                fist_hold_count = 0
+                # Hand lost — reset transient state
+                hand_was_present       = False
+                fist_hold_count        = 0
                 fist_toggled_this_hold = False
-                scroll_ref_y = None
-                taskview_hold_count = 0
-                if drag_active:              # hand lost mid-drag — release button
+                scroll_ref_y           = None
+                taskview_hold_count    = 0
+                if drag_active:
                     mouse_up()
                     drag_active = False
                 active_gesture = "NONE"
@@ -556,9 +696,18 @@ def run():
                 flash_taskview=(now < taskview_flash_until),
                 flash_minimize=(now < minimize_flash_until),
             )
-            cv2.imshow("Kontrol v0.4", frame)
-            if cv2.waitKey(1) & 0xFF == ord("q"):
-                print("Quit."); break
+            draw_buttons(frame)
+            cv2.imshow(win_name, frame)
+
+            if _quit_flag[0] or (cv2.waitKey(1) & 0xFF == ord("q")):
+                print("Quit.")
+                break
+
+            # 20 fps cap — sleep remainder of frame interval
+            elapsed   = time.time() - frame_start
+            remaining = FRAME_INTERVAL - elapsed
+            if remaining > 0.002:
+                time.sleep(remaining)
 
     cap.release()
     cv2.destroyAllWindows()
