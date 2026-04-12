@@ -3,7 +3,7 @@
 # All controls verified against: v4l2-ctl -d /dev/video2 --list-ctrls
 set -e
 
-DEV=/dev/video2
+DEV=/dev/v4l/by-id/usb-046d_HD_Pro_Webcam_C920_92E67B2F-video-index0
 
 echo "[cam-tune] Tuning $DEV for hand tracking..."
 
