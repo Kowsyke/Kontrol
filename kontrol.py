@@ -51,9 +51,10 @@ _DEFAULTS = {
     "smoothing": {
         # Velocity-adaptive EMA: factor = clamp(vel_norm * scale, min, max)
         # vel_norm = pixel_delta / screen_diagonal  (0..~0.15 for typical hand motion)
-        "min_smooth":     "0.08",
-        "max_smooth":     "0.35",
-        "velocity_scale": "2.5",
+        "min_smooth":        "0.05",
+        "max_smooth":        "0.22",
+        "velocity_scale":    "1.5",
+        "cursor_deadzone_px": "2",   # skip moves smaller than this to absorb landmark jitter
     },
     "gestures": {
         "pinch_threshold":    "0.05",   # normalized landmark distance → click
@@ -101,7 +102,8 @@ CAM_ID           = _cfg.getint("camera",    "id")
 FLIP             = _cfg.getboolean("camera","flip")
 MIN_SMOOTH       = _cfg.getfloat("smoothing", "min_smooth")
 MAX_SMOOTH       = _cfg.getfloat("smoothing", "max_smooth")
-VELOCITY_SCALE   = _cfg.getfloat("smoothing", "velocity_scale")
+VELOCITY_SCALE      = _cfg.getfloat("smoothing", "velocity_scale")
+CURSOR_DEADZONE_PX  = _cfg.getint("smoothing",  "cursor_deadzone_px")
 PINCH_THRESHOLD  = _cfg.getfloat("gestures", "pinch_threshold")
 PINCH_COOLDOWN   = _cfg.getfloat("gestures", "pinch_cooldown")
 SCROLL_DEADZONE  = _cfg.getfloat("gestures", "scroll_deadzone")
@@ -494,7 +496,7 @@ def run():
                         prev_tx, prev_ty = tx, ty
                         dx = round(cx - prev_sent_x)
                         dy = round(cy - prev_sent_y)
-                        if dx != 0 or dy != 0:
+                        if max(abs(dx), abs(dy)) >= CURSOR_DEADZONE_PX:
                             move_cursor(dx, dy)
                             prev_sent_x += dx
                             prev_sent_y += dy
