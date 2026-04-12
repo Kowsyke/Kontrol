@@ -1,5 +1,131 @@
 # Kontrol — Change Log
 
+## v0.5.1 — 2026-04-12 (Session 5 patch)
+
+Four regressions diagnosed and fixed.
+
+### Regression 1 — Cursor too slow to cover both monitors
+**Root cause:** `velocity_scale=2.0` + `max_smooth=0.18` left over from pre-zone-mapping
+tuning.  Zone mapping compresses input range to ~70% of camera frame, which reduces
+per-frame pixel deltas → lower `vel_norm` → EMA factor capped at 0.18 even during fast
+sweeps → heavily damped motion.
+
+**Fix:** Config only.
+| Key | Before | After |
+|---|---|---|
+| `landmark_smooth` | 0.4 | 0.3 |
+| `max_smooth` | 0.18 | 0.35 |
+| `velocity_scale` | 2.0 | 3.5 |
+
+### Regression 2 — Scroll command silently failing
+**Root cause:** `ydotool mousemove --wheel -y <N>` always exits 1 on this build.
+ydotool's `mousemove` parser requires `-x` to be provided when using `--wheel`; without
+it the argument set is considered invalid and the command prints usage and exits.
+Both `scroll_up` and `scroll_down` were silently dead — every scroll tick was dropped.
+Diagnosed via `CHECK 2`: `--wheel -y -3` → exit 1, `--wheel -x 0 -y -3` → exit 0.
+
+**Fix:** Code — added `-x 0` to both functions.
+```python
+# before:  ydocall("mousemove", "--wheel", "-y", str(-ticks))
+# after:   ydocall("mousemove", "--wheel", "-x", "0", "-y", str(-ticks))
+```
+
+### Regression 3 — Scroll pose too strict
+**Root cause:** `is_scroll_pose` checked ring and pinky curl against their **PIP** joints
+(landmarks 14 and 18).  A natural two-finger scroll hold only curls fingers to roughly
+mid-range — tip often stays above PIP, so the pose never registered.
+
+**Fix:** Code — relaxed ring and pinky curl check to **MCP** joints (landmarks 13 and 17).
+```python
+# before:  not is_finger_extended(lm, 16, 14)   # ring tip vs ring PIP
+#          not is_finger_extended(lm, 20, 18)   # pinky tip vs pinky PIP
+# after:   not is_finger_extended(lm, 16, 13)   # ring tip vs ring MCP (more lenient)
+#          not is_finger_extended(lm, 20, 17)   # pinky tip vs pinky MCP
+```
+Also lowered `scroll_deadzone 0.012 → 0.010` and `scroll_speed 8.0 → 6.0` for smoother
+per-tick feel.
+
+### Regression 4 — Flick detection unreachable at 20 fps
+**Root cause:** `flick_min_velocity=2.0` norm/s with `flick_window_ms=120` at 20 fps =
+~2.4 frames of data.  Maximum realistic wrist displacement in 120 ms ≈ 0.08 normalized
+units → peak velocity ≈ 0.67 norm/s, well below the 2.0 threshold.  Combined with
+`flick_axis_ratio=3.0`, no deliberate flick could ever pass both gates.
+
+**Fix:** Config only.
+| Key | Before | After |
+|---|---|---|
+| `flick_min_velocity` | 2.0 | 1.2 |
+| `flick_window_ms` | 120 | 150 |
+| `flick_axis_ratio` | 3.0 | 2.0 |
+
+---
+
+## v0.5 — 2026-04-12 (Session 5) — "Stark Pass"
+
+### Zone-based hand mapping
+Active tracking zone: `[0.15–0.85 x, 0.10–0.90 y]` in camera-normalized space.
+The hand no longer needs to travel to the physical frame edge to reach the screen edge —
+the zone maps linearly to the full screen, so 70% of lateral travel covers 100% of width.
+New `[mapping]` config section:
+```ini
+zone_x_min = 0.15  |  zone_x_max = 0.85
+zone_y_min = 0.10  |  zone_y_max = 0.90
+edge_boost  = 1.8
+```
+`edge_boost` multiplies the velocity-scale factor when the mapped cursor is within 10% of
+a screen edge, allowing snappy corner-reaching without leaving the zone.
+
+### Double EMA smoothing
+Two-stage pipeline replacing the single velocity-adaptive EMA:
+
+| Stage | What | Alpha |
+|---|---|---|
+| 1 — Landmark pre-filter | Fixed EMA on raw LM 8 (x,y) before zone mapping | `landmark_smooth = 0.4` |
+| 2 — Screen-space EMA | Velocity-adaptive factor after zone mapping | `clamp(vel_norm × scale × boost, min, max)` |
+
+Updated Stage 2 parameters: `max_smooth 0.22 → 0.18`, `velocity_scale 1.5 → 2.0`.
+
+### Strict gesture priority chain
+Dispatcher rebuilt as a clean `if/elif` ladder — no nested conditional tangles:
+
+```
+fist → lock → wrist_rotate → scroll → flick → right_click → left_pinch → cursor
+```
+
+Wrist-rotate is now checked before scroll (previously scroll had higher priority).
+
+### In-frame ✕ / — buttons
+Two buttons drawn top-right of the cv2 preview window; mouse-clickable via `setMouseCallback`:
+- **✕** sets `_quit_flag[0] = True` → main loop exits cleanly.
+- **—** calls `wmctrl -r :ACTIVE: -b add,hidden` → iconifies the active KDE window.
+
+### Single-hand confidence raised
+`min_hand_presence_confidence`: 0.60 → **0.70** (detection stays 0.70, tracking stays 0.60).
+Reduces ghost-hand detections from reflective surfaces and out-of-frame partial hands.
+
+### Performance
+| Change | Detail |
+|---|---|
+| `ydocall` fire-and-forget | Cursor/click calls use `subprocess.Popen`; key sequences use `subprocess.run` (blocking) |
+| 20 fps cap | `time.sleep(remaining)` at end of each frame loop — prevents CPU saturation at idle |
+| Rolling FPS EMA | Per-frame `fps = fps × 0.9 + instant_fps × 0.1` — display no longer resets every second |
+
+### Hand visibility warning
+When `lm[8]` (index tip) enters the outer 15% of the camera frame, a directional arrow
+is drawn from the fingertip toward the frame centre, labelled **MOVE IN**.
+Cues the user to reposition before they exit the active tracking zone.
+
+### Smooth cursor re-entry
+New `hand_was_present` bool. On the first frame after the hand re-enters the camera view:
+- `raw_x_smooth` / `raw_y_smooth` are re-initialized to the current landmark position.
+- `cx`, `cy`, `prev_tx/ty`, `prev_sent_x/y` are all reset to the mapped position.
+- No cursor delta is sent on that frame — eliminates the jump-to-corner artifact on re-entry.
+
+### Startup sound
+Triple ascending tone — 880 → 1047 → 1319 Hz — replaces v0.4 double-beep.
+
+---
+
 ## v0.4 — 2026-04-12 (Session 4)
 
 ### Camera: brightness / flicker fix
