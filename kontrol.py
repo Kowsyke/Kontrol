@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Kontrol v0.2 — Hand gesture mouse control
+Kontrol v0.3 — Hand gesture mouse control
 MediaPipe Tasks API (0.10+) → ydotool (no pynput, Wayland-safe)
 
 Gestures:
@@ -9,7 +9,10 @@ Gestures:
   Pinch ring+thumb   (LM 16+4)                → right click
   Index+middle extended, ring+pinky curled    → scroll (up/down with speed scaling)
   Wrist flick (LM 0 velocity)                 → KDE window tiling (Meta+Arrow)
-  Fist (all 4 tips below MCP joints)          → toggle tracking lock
+  Wrist rotate (fingers pointing down)        → KDE task overview (Meta+PgUp)
+  Fist SHORT  (<  fist_minimize_frames)       → ignored
+  Fist MEDIUM (>= fist_minimize_frames, released before fist_lock_frames) → minimize window
+  Fist LONG   (>= fist_lock_frames, held)     → toggle tracking lock
 
 Config is read from kontrol.conf (INI format) in the same directory.
 If kontrol.conf is missing it is created with default values.
@@ -59,7 +62,10 @@ _DEFAULTS = {
         "flick_min_velocity": "450",    # px/s wrist velocity to register flick
         "flick_window_ms":    "120",    # ms window for velocity measurement
         "flick_cooldown":     "0.8",    # seconds between consecutive tiling gestures
-        "fist_hold_frames":   "6",      # frames fist must be held to toggle lock
+        "fist_minimize_frames": "6",    # medium fist hold: minimize current window
+        "fist_lock_frames":     "12",   # long fist hold: toggle tracking lock
+        "taskview_hold_frames": "8",    # frames wrist-rotated before task view fires
+        "taskview_cooldown":    "1.5",  # seconds between task view triggers
     },
     "system": {
         "ydotool_socket": "/run/user/1000/.ydotool_socket",
@@ -100,9 +106,12 @@ SCROLL_DEADZONE  = _cfg.getfloat("gestures", "scroll_deadzone")
 SCROLL_SPEED     = _cfg.getfloat("gestures", "scroll_speed")
 FLICK_MIN_VEL    = _cfg.getfloat("gestures", "flick_min_velocity")
 FLICK_WINDOW_MS  = _cfg.getfloat("gestures", "flick_window_ms")
-FLICK_COOLDOWN   = _cfg.getfloat("gestures", "flick_cooldown")
-FIST_HOLD_FRAMES = _cfg.getint("gestures",   "fist_hold_frames")
-YDOTOOL_SOCKET   = _cfg.get("system",        "ydotool_socket")
+FLICK_COOLDOWN       = _cfg.getfloat("gestures", "flick_cooldown")
+FIST_MINIMIZE_FRAMES = _cfg.getint("gestures",  "fist_minimize_frames")
+FIST_LOCK_FRAMES     = _cfg.getint("gestures",  "fist_lock_frames")
+TASKVIEW_HOLD_FRAMES = _cfg.getint("gestures",  "taskview_hold_frames")
+TASKVIEW_COOLDOWN    = _cfg.getfloat("gestures","taskview_cooldown")
+YDOTOOL_SOCKET       = _cfg.get("system",       "ydotool_socket")
 ABS_SCALE_X      = _cfg.getfloat("system",   "abs_scale_x")
 ABS_SCALE_Y      = _cfg.getfloat("system",   "abs_scale_y")
 
@@ -176,6 +185,11 @@ def is_fist(lm) -> bool:
     mcps = [5,  9, 13, 17]
     return all(lm[t].y > lm[m].y for t, m in zip(tips, mcps))
 
+def is_wrist_rotated(lm) -> bool:
+    """Hand flipped so fingers point down: middle fingertip (LM 12) y > wrist (LM 0) y by margin."""
+    return lm[12].y > lm[0].y + 0.10
+
+
 def check_flick(history: deque) -> str | None:
     """
     Measure wrist velocity over the last FLICK_WINDOW_MS milliseconds.
@@ -235,13 +249,18 @@ def draw_skeleton(frame, lm, fw: int, fh: int):
 
 
 def draw_hud(frame, locked: bool, gesture: str, fps: float,
-             pd_L: float, pd_R: float):
+             pd_L: float, pd_R: float,
+             fist_count: int = 0,
+             flash_taskview: bool = False,
+             flash_minimize: bool = False):
     h, w = frame.shape[:2]
     border_color = (0, 40, 200) if locked else (30, 190, 50)
     cv2.rectangle(frame, (0, 0), (w - 1, h - 1), border_color, 3)
     mode_txt = "LOCKED" if locked else "TRACKING"
     cv2.putText(frame, mode_txt, (w // 2 - 58, h - 14),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.8, border_color, 2)
+
+    # ── standard HUD lines ────────────────────────────────────────────────────
     for i, txt in enumerate([
         f"FPS     {fps:5.1f}",
         f"Mode    {mode_txt}",
@@ -251,6 +270,23 @@ def draw_hud(frame, locked: bool, gesture: str, fps: float,
     ]):
         cv2.putText(frame, txt, (8, 18 + i * 18),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.45, (210, 210, 210), 1)
+
+    # ── fist hold progress bar ────────────────────────────────────────────────
+    if fist_count > 0:
+        BAR_BLOCKS = 12
+        filled  = min(fist_count, BAR_BLOCKS)
+        bar     = "\u2588" * filled + "\u2591" * (BAR_BLOCKS - filled)
+        bar_txt = f"FIST [{bar}] {fist_count}/{FIST_LOCK_FRAMES}"
+        cv2.putText(frame, bar_txt, (8, 18 + 5 * 18),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.40, (80, 200, 255), 1)
+
+    # ── flash overlays ────────────────────────────────────────────────────────
+    if flash_taskview:
+        cv2.putText(frame, "TASK VIEW", (w // 2 - 90, h // 2),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 200), 3)
+    if flash_minimize:
+        cv2.putText(frame, "MINIMIZE", (w // 2 - 80, h // 2 + 48),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.1, (0, 200, 255), 3)
 
 
 # ── Main loop ─────────────────────────────────────────────────────────────────
@@ -291,14 +327,20 @@ def run():
     fist_hold_count        = 0
     fist_toggled_this_hold = False
 
+    taskview_hold_count = 0
+    last_taskview_t     = 0.0
+    taskview_flash_until = 0.0
+    minimize_flash_until = 0.0
+
     active_gesture = "NONE"
     pd_L_hud = pd_R_hud = 1.0
     fps = 0.0;  frame_count = 0;  fps_timer = time.time()
 
-    print(f"Kontrol v0.2  {SCREEN_W}x{SCREEN_H}"
+    print(f"Kontrol v0.3  {SCREEN_W}x{SCREEN_H}"
           f"  smooth[{MIN_SMOOTH}-{MAX_SMOOTH}]x{VELOCITY_SCALE}"
           f"  pinch={PINCH_THRESHOLD}  config={CONF_PATH.name}")
-    print("  Fist = toggle lock   Q in preview = quit")
+    print(f"  Fist {FIST_MINIMIZE_FRAMES}fr=minimize  {FIST_LOCK_FRAMES}fr=lock"
+          f"  WristRotate {TASKVIEW_HOLD_FRAMES}fr=taskview   Q=quit")
 
     with HandLandmarker.create_from_options(opts) as detector:
         while cap.isOpened():
@@ -330,92 +372,129 @@ def run():
                 pd_L_hud = pinch_dist(lm, 4, 8)
                 pd_R_hud = pinch_dist(lm, 4, 16)
 
+                # ── Fist: tiered hold (runs regardless of lock state) ─────────
                 fist_now = is_fist(lm)
                 if fist_now:
                     fist_hold_count += 1
+                    # Long hold → toggle lock immediately (don't wait for release)
+                    if fist_hold_count >= FIST_LOCK_FRAMES and not fist_toggled_this_hold:
+                        locked = not locked
+                        fist_toggled_this_hold = True
                 else:
+                    # Fist released — check for medium hold → minimize
+                    if (FIST_MINIMIZE_FRAMES <= fist_hold_count < FIST_LOCK_FRAMES
+                            and not fist_toggled_this_hold
+                            and not locked):
+                        # Meta+Down — minimizes floating window, restores tiled (acceptable)
+                        ydocall("key", "125:1", "109:1", "109:0", "125:0")
+                        minimize_flash_until = now + 0.5
+                        active_gesture = "MINIMIZE"
                     fist_hold_count = 0
                     fist_toggled_this_hold = False
 
-                if fist_hold_count >= FIST_HOLD_FRAMES and not fist_toggled_this_hold:
-                    locked = not locked
-                    fist_toggled_this_hold = True
-
+                # ── Locked mode ───────────────────────────────────────────────
                 if locked:
                     active_gesture = "FIST-LOCKED" if fist_now else "LOCKED"
 
-                else:
-                    if is_scroll_pose(lm):
-                        cur_y = lm[8].y
-                        if scroll_ref_y is None:
-                            scroll_ref_y = cur_y
-                        else:
-                            dy = cur_y - scroll_ref_y
-                            scroll_ref_y = cur_y
-                            if abs(dy) > SCROLL_DEADZONE:
-                                ticks = max(1, int(abs(dy) * SCROLL_SPEED))
-                                if dy < 0:
-                                    scroll_up(ticks)
-                                    active_gesture = f"SCROLL UP x{ticks}"
-                                else:
-                                    scroll_down(ticks)
-                                    active_gesture = f"SCROLL DN x{ticks}"
-                            else:
-                                active_gesture = "SCROLL"
+                # ── Fist held but not yet locked — show progress, skip gestures
+                elif fist_now:
+                    active_gesture = f"FIST {fist_hold_count}/{FIST_LOCK_FRAMES}"
 
-                        for lm_idx in [8, 12]:
-                            px = (int(lm[lm_idx].x * fw_px), int(lm[lm_idx].y * fh_px))
-                            cv2.circle(frame, px, 14, (0, 200, 255), -1)
-                            cv2.circle(frame, px, 14, (255, 255, 255), 2)
+                # ── Active gesture dispatch ───────────────────────────────────
+                elif is_scroll_pose(lm):
+                    taskview_hold_count = 0
+                    cur_y = lm[8].y
+                    if scroll_ref_y is None:
+                        scroll_ref_y = cur_y
                     else:
-                        scroll_ref_y = None
-
-                        flick = check_flick(wrist_history)
-                        if flick and (now - last_flick_t) > FLICK_COOLDOWN:
-                            tiling_key(flick)
-                            last_flick_t = now
-                            active_gesture = f"FLICK {flick.upper()}"
-                            wrist_history.clear()
+                        dy = cur_y - scroll_ref_y
+                        scroll_ref_y = cur_y
+                        if abs(dy) > SCROLL_DEADZONE:
+                            ticks = max(1, int(abs(dy) * SCROLL_SPEED))
+                            if dy < 0:
+                                scroll_up(ticks)
+                                active_gesture = f"SCROLL UP x{ticks}"
+                            else:
+                                scroll_down(ticks)
+                                active_gesture = f"SCROLL DN x{ticks}"
                         else:
-                            tx = lm[8].x * SCREEN_W
-                            ty = lm[8].y * SCREEN_H
+                            active_gesture = "SCROLL"
 
-                            vel_norm = math.hypot(tx - prev_tx, ty - prev_ty) / SCREEN_DIAG
-                            smooth   = max(MIN_SMOOTH, min(MAX_SMOOTH,
-                                                           vel_norm * VELOCITY_SCALE))
-                            cx = cx * (1.0 - smooth) + tx * smooth
-                            cy = cy * (1.0 - smooth) + ty * smooth
-                            prev_tx, prev_ty = tx, ty
-                            move_cursor(cx, cy)
+                    for lm_idx in [8, 12]:
+                        px = (int(lm[lm_idx].x * fw_px), int(lm[lm_idx].y * fh_px))
+                        cv2.circle(frame, px, 14, (0, 200, 255), -1)
+                        cv2.circle(frame, px, 14, (255, 255, 255), 2)
 
-                            if pd_R_hud < PINCH_THRESHOLD:
-                                if not pinch_held_R and (now - last_click_R) > PINCH_COOLDOWN:
-                                    right_click(); last_click_R = now
-                                pinch_held_R = True
-                                active_gesture = f"RIGHT CLICK d={pd_R_hud:.3f}"
-                            else:
-                                pinch_held_R = False
+                elif is_wrist_rotated(lm):
+                    # Wrist rotate: fingers pointing down → KDE task overview
+                    scroll_ref_y = None
+                    taskview_hold_count += 1
+                    if (taskview_hold_count >= TASKVIEW_HOLD_FRAMES
+                            and (now - last_taskview_t) > TASKVIEW_COOLDOWN):
+                        # Meta+PgUp (KEY_LEFTMETA=125, KEY_PAGEUP=104)
+                        ydocall("key", "125:1", "104:1", "104:0", "125:0")
+                        # Alt: Meta+W  ydocall("key", "125:1", "17:1", "17:0", "125:0")
+                        last_taskview_t = now
+                        taskview_flash_until = now + 1.0
+                        taskview_hold_count = 0
+                    active_gesture = f"ROTATE {taskview_hold_count}/{TASKVIEW_HOLD_FRAMES}"
 
-                            if pd_L_hud < PINCH_THRESHOLD and not (pd_R_hud < PINCH_THRESHOLD):
-                                if not pinch_held_L and (now - last_click_L) > PINCH_COOLDOWN:
-                                    left_click(); last_click_L = now
-                                pinch_held_L = True
-                                active_gesture = f"LEFT CLICK  d={pd_L_hud:.3f}"
-                            else:
-                                pinch_held_L = False
+                else:
+                    scroll_ref_y = None
+                    taskview_hold_count = 0
 
-                            if not (pd_L_hud < PINCH_THRESHOLD) and \
-                               not (pd_R_hud < PINCH_THRESHOLD):
-                                active_gesture = "CURSOR"
+                    flick = check_flick(wrist_history)
+                    if flick and (now - last_flick_t) > FLICK_COOLDOWN:
+                        tiling_key(flick)
+                        last_flick_t = now
+                        active_gesture = f"FLICK {flick.upper()}"
+                        wrist_history.clear()
+                    else:
+                        tx = lm[8].x * SCREEN_W
+                        ty = lm[8].y * SCREEN_H
 
-                        draw_skeleton(frame, lm, fw_px, fh_px)
+                        vel_norm = math.hypot(tx - prev_tx, ty - prev_ty) / SCREEN_DIAG
+                        smooth   = max(MIN_SMOOTH, min(MAX_SMOOTH,
+                                                       vel_norm * VELOCITY_SCALE))
+                        cx = cx * (1.0 - smooth) + tx * smooth
+                        cy = cy * (1.0 - smooth) + ty * smooth
+                        prev_tx, prev_ty = tx, ty
+                        move_cursor(cx, cy)
+
+                        if pd_R_hud < PINCH_THRESHOLD:
+                            if not pinch_held_R and (now - last_click_R) > PINCH_COOLDOWN:
+                                right_click(); last_click_R = now
+                            pinch_held_R = True
+                            active_gesture = f"RIGHT CLICK d={pd_R_hud:.3f}"
+                        else:
+                            pinch_held_R = False
+
+                        if pd_L_hud < PINCH_THRESHOLD and not (pd_R_hud < PINCH_THRESHOLD):
+                            if not pinch_held_L and (now - last_click_L) > PINCH_COOLDOWN:
+                                left_click(); last_click_L = now
+                            pinch_held_L = True
+                            active_gesture = f"LEFT CLICK  d={pd_L_hud:.3f}"
+                        else:
+                            pinch_held_L = False
+
+                        if not (pd_L_hud < PINCH_THRESHOLD) and \
+                           not (pd_R_hud < PINCH_THRESHOLD):
+                            active_gesture = "CURSOR"
+
+                draw_skeleton(frame, lm, fw_px, fh_px)
             else:
                 fist_hold_count = 0
                 fist_toggled_this_hold = False
                 scroll_ref_y = None
+                taskview_hold_count = 0
                 active_gesture = "NONE"
 
-            draw_hud(frame, locked, active_gesture, fps, pd_L_hud, pd_R_hud)
+            draw_hud(
+                frame, locked, active_gesture, fps, pd_L_hud, pd_R_hud,
+                fist_count=fist_hold_count,
+                flash_taskview=(now < taskview_flash_until),
+                flash_minimize=(now < minimize_flash_until),
+            )
             cv2.imshow("Kontrol v0.2", frame)
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 print("Quit."); break
