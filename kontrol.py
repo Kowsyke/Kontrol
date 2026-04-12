@@ -338,6 +338,14 @@ def run():
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
     cap.set(cv2.CAP_PROP_FPS,          30)
 
+    # Re-apply v4l2 tuning AFTER VideoCapture opens the device.
+    # cv2.VideoCapture() resets UVC controls to driver defaults on open,
+    # so cam-tune.sh must run here, not in run.sh before Python starts.
+    _tune = Path(__file__).parent / "cam-tune.sh"
+    if _tune.exists():
+        subprocess.run(["bash", str(_tune)],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
     play_startup_sound()
 
     cx, cy           = float(SCREEN_W) / 2, float(SCREEN_H) / 2
