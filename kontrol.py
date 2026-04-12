@@ -146,8 +146,9 @@ def ydocall(*args):
         stderr=subprocess.DEVNULL,
     )
 
-def move_cursor(x: float, y: float):
-    ydocall("mousemove", "-a", "-x", int(x * ABS_SCALE_X), "-y", int(y * ABS_SCALE_Y))
+def move_cursor(dx: int, dy: int):
+    """Send relative mouse delta. ydotoold has no EV_ABS — only REL works."""
+    ydocall("mousemove", "-x", dx, "-y", dy)
 
 def left_click():    ydocall("click", "0xC0")
 def right_click():   ydocall("click", "0xC1")
@@ -319,6 +320,9 @@ def run():
 
     cx, cy           = float(SCREEN_W) / 2, float(SCREEN_H) / 2
     prev_tx, prev_ty = cx, cy
+    # Relative movement: track what integer position was last sent so we
+    # compute correct deltas each frame. Floats so sub-pixel accumulates.
+    prev_sent_x, prev_sent_y = cx, cy
     pinch_held_L  = False;  last_click_L = 0.0
     pinch_held_R  = False;  last_click_R = 0.0
     scroll_ref_y  = None
@@ -461,7 +465,12 @@ def run():
                         cx = cx * (1.0 - smooth) + tx * smooth
                         cy = cy * (1.0 - smooth) + ty * smooth
                         prev_tx, prev_ty = tx, ty
-                        move_cursor(cx, cy)
+                        dx = round(cx - prev_sent_x)
+                        dy = round(cy - prev_sent_y)
+                        if dx != 0 or dy != 0:
+                            move_cursor(dx, dy)
+                            prev_sent_x += dx
+                            prev_sent_y += dy
 
                         if pd_R_hud < PINCH_THRESHOLD:
                             if not pinch_held_R and (now - last_click_R) > PINCH_COOLDOWN:
