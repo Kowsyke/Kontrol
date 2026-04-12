@@ -308,7 +308,9 @@ def run():
         min_tracking_confidence=0.60,
     )
 
-    cap = cv2.VideoCapture(CAM_ID)
+    cap = cv2.VideoCapture(CAM_ID, cv2.CAP_V4L2)
+    # MJPG: camera compresses before USB transfer — required for C920 on USB2
+    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
     cap.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
     cap.set(cv2.CAP_PROP_FPS,          30)
