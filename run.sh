@@ -19,4 +19,8 @@ if ! systemctl --user is-active --quiet ydotoold.service; then
 fi
 
 source venv/bin/activate
+
+# Apply C920 v4l2 tuning on every launch
+bash cam-tune.sh
+
 exec python kontrol.py "$@"
