@@ -75,8 +75,8 @@ _DEFAULTS = {
         # Stage 2 — velocity-adaptive screen-space EMA.
         # smooth = clamp(vel_norm * velocity_scale * boost, min_smooth, max_smooth)
         "min_smooth":         "0.05",
-        "max_smooth":         "0.18",
-        "velocity_scale":     "2.0",
+        "max_smooth":         "0.35",
+        "velocity_scale":     "3.5",
         "cursor_deadzone_px": "2",     # skip moves ≤ this to kill residual jitter
         "still_threshold":    "0.0015", # vel_norm below this → freeze EMA (kills drift)
     },
@@ -98,6 +98,19 @@ _DEFAULTS = {
         "ydotool_socket": "/run/user/1000/.ydotool_socket",
         "abs_scale_x":    "1.0",
         "abs_scale_y":    "1.0",
+    },
+    "camera_tuning": {
+        "auto_exposure":            "1",
+        "exposure_time_absolute":   "300",
+        "exposure_dynamic_framerate": "0",
+        "gain":                     "100",
+        "brightness":               "160",
+        "contrast":                 "130",
+        "saturation":               "128",
+        "backlight_compensation":   "1",
+        "power_line_frequency":     "1",
+        "focus_autos":              "0",
+        "focus_absolute":           "30",
     },
 }
 
@@ -148,6 +161,44 @@ ABS_SCALE_X        = _cfg.getfloat("system",   "abs_scale_x")
 ABS_SCALE_Y        = _cfg.getfloat("system",   "abs_scale_y")
 
 SCREEN_DIAG = math.hypot(SCREEN_W, SCREEN_H)
+
+
+# ── Camera v4l2 tuning ────────────────────────────────────────────────────────
+def apply_camera_settings():
+    """
+    Apply v4l2 camera settings from kontrol.conf [camera_tuning].
+    Call AFTER cv2.VideoCapture opens and FOURCC/resolution are set.
+    Controls are applied in the correct dependency order; each is wrapped
+    in try/except so unknown controls are skipped silently.
+    """
+    dev = f"/dev/video{CAM_ID}"
+    ct  = _cfg["camera_tuning"]
+
+    def v4l2_set(ctrl: str, value: str):
+        try:
+            subprocess.run(
+                ["v4l2-ctl", "-d", dev, f"--set-ctrl={ctrl}={value}"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                timeout=2,
+            )
+            print(f"[CAM] {ctrl} = {value} \u2713")
+        except Exception as exc:
+            print(f"[CAM] {ctrl} SKIPPED ({exc})")
+
+    # Order matters: auto_exposure=1 must precede exposure_time_absolute,
+    # and focus_automatic_continuous=0 must precede focus_absolute.
+    v4l2_set("auto_exposure",             ct.get("auto_exposure", "1"))
+    v4l2_set("exposure_dynamic_framerate", ct.get("exposure_dynamic_framerate", "0"))
+    v4l2_set("exposure_time_absolute",    ct.get("exposure_time_absolute", "300"))
+    v4l2_set("gain",                      ct.get("gain", "100"))
+    v4l2_set("brightness",                ct.get("brightness", "160"))
+    v4l2_set("contrast",                  ct.get("contrast", "130"))
+    v4l2_set("saturation",                ct.get("saturation", "128"))
+    v4l2_set("backlight_compensation",    ct.get("backlight_compensation", "1"))
+    v4l2_set("power_line_frequency",      ct.get("power_line_frequency", "1"))
+    # focus_autos in conf → focus_automatic_continuous in v4l2
+    v4l2_set("focus_automatic_continuous", ct.get("focus_autos", "0"))
+    v4l2_set("focus_absolute",            ct.get("focus_absolute", "30"))
 
 # Raw Linux keycodes (input-event-codes.h).
 # KEY_LEFTMETA=125, KEY_LEFT=105, KEY_RIGHT=106, KEY_UP=103, KEY_DOWN=108
@@ -438,17 +489,12 @@ def run():
     #   Pass 2 — after 5 warm-up reads that trigger VIDIOC_STREAMON.
     #   The C920 resets exposure_time_absolute (and sometimes gain) when the
     #   stream starts; pass 2 re-locks everything after that reset fires.
-    _tune = Path(__file__).parent / "cam-tune.sh"
-    if _tune.exists():
-        subprocess.run(["bash", str(_tune)],
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    apply_camera_settings()
 
     for _ in range(5):       # trigger VIDIOC_STREAMON + drain startup frames
         cap.read()
 
-    if _tune.exists():       # re-apply — locks exposure after stream-on reset
-        subprocess.run(["bash", str(_tune)],
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    apply_camera_settings()  # re-lock exposure after stream-on reset
 
     play_startup_sound()
 
