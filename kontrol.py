@@ -716,11 +716,13 @@ def run():
                         if (palm_hold_count >= PALM_HOLD_FRAMES
                                 and (now - last_palm_t) > PALM_COOLDOWN):
                             if palm_minimized:
-                                ydocall("key", "125:1", "108:1", "108:0", "125:0", blocking=True)
+                                # Restore / maximize: Meta+PgUp (KEY_PAGEUP=104)
+                                ydocall("key", "125:1", "104:1", "104:0", "125:0", blocking=True)
                                 palm_minimized = False
                                 flash_msg      = "RESTORE"
                             else:
-                                ydocall("key", "125:1", "108:1", "108:0", "125:0", blocking=True)
+                                # Minimize: Meta+PgDown (KEY_PAGEDOWN=109)
+                                ydocall("key", "125:1", "109:1", "109:0", "125:0", blocking=True)
                                 palm_minimized = True
                                 flash_msg      = "MINIMIZE"
                             flash_until = now + 0.8
