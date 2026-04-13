@@ -65,6 +65,13 @@ _DEFAULTS = {
         "tile_window_frames":   "8",
         "tile_cooldown":        "0.8",
     },
+    "detection": {
+        # Lower = more permissive; 0.50 works reliably on i5 with C920
+        # Raise toward 0.70 only if you see ghost-hand false-positives
+        "detection_confidence": "0.50",
+        "presence_confidence":  "0.50",
+        "tracking_confidence":  "0.50",
+    },
     "system": {
         "ydotool_socket": "/run/user/1000/.ydotool_socket",
     },
@@ -119,8 +126,11 @@ PALM_HOLD_FRAMES    = _cfg.getint("gestures",    "palm_hold_frames")
 PALM_COOLDOWN       = _cfg.getfloat("gestures",  "palm_cooldown")
 TILE_MOVE_THRESHOLD = _cfg.getfloat("gestures",  "tile_move_threshold")
 TILE_WINDOW_FRAMES  = _cfg.getint("gestures",    "tile_window_frames")
-TILE_COOLDOWN       = _cfg.getfloat("gestures",  "tile_cooldown")
-YDOTOOL_SOCKET      = _cfg.get("system",         "ydotool_socket")
+TILE_COOLDOWN         = _cfg.getfloat("gestures",  "tile_cooldown")
+YDOTOOL_SOCKET        = _cfg.get("system",         "ydotool_socket")
+DETECTION_CONFIDENCE  = _cfg.getfloat("detection", "detection_confidence")
+PRESENCE_CONFIDENCE   = _cfg.getfloat("detection", "presence_confidence")
+TRACKING_CONFIDENCE   = _cfg.getfloat("detection", "tracking_confidence")
 
 SCREEN_DIAG = math.hypot(SCREEN_W, SCREEN_H)
 
@@ -588,11 +598,11 @@ def run():
 
     opts = HandLandmarkerOptions(
         base_options=BaseOptions(model_asset_path=str(MODEL_PATH)),
-        running_mode=RunningMode.IMAGE,
+        running_mode=RunningMode.VIDEO,   # temporal tracking vs per-frame re-detect
         num_hands=1,
-        min_hand_detection_confidence=0.70,
-        min_hand_presence_confidence=0.70,
-        min_tracking_confidence=0.60,
+        min_hand_detection_confidence=DETECTION_CONFIDENCE,
+        min_hand_presence_confidence=PRESENCE_CONFIDENCE,
+        min_tracking_confidence=TRACKING_CONFIDENCE,
     )
 
     cap = cv2.VideoCapture(CAM_ID, cv2.CAP_V4L2)
@@ -600,6 +610,7 @@ def run():
     cap.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
     cap.set(cv2.CAP_PROP_FPS,          30)
+    cap.set(cv2.CAP_PROP_BUFFERSIZE,   1)   # always read latest frame; prevents stale-buffer stalls
 
     apply_camera_settings()
     for _ in range(5):
@@ -663,6 +674,8 @@ def run():
           f"  lm={LANDMARK_SMOOTH}  smooth[{MIN_SMOOTH}-{MAX_SMOOTH}]x{VELOCITY_SCALE}"
           f"  pinch={PINCH_THRESHOLD}  palm={PALM_HOLD_FRAMES}fr  tile={TILE_MOVE_THRESHOLD}")
 
+    _last_ts_ms = 0   # VIDEO mode requires strictly increasing timestamps
+
     with HandLandmarker.create_from_options(opts) as detector:
         while cap.isOpened():
             frame_start = time.time()
@@ -678,13 +691,17 @@ def run():
             if dt > 0:
                 fps = fps * (1.0 - fps_alpha) + (1.0 / dt) * fps_alpha
 
+            # Monotonic timestamp for VIDEO mode (must be strictly increasing)
+            _ts_ms      = max(int(now * 1000), _last_ts_ms + 1)
+            _last_ts_ms = _ts_ms
+
             if FLIP:
                 frame = cv2.flip(frame, 1)
 
             fh_px, fw_px = frame.shape[:2]
             rgb      = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-            result   = detector.detect(mp_image)
+            result   = detector.detect_for_video(mp_image, _ts_ms)
 
             if result.hand_landmarks:
                 lm = result.hand_landmarks[0]
