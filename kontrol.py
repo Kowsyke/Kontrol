@@ -111,6 +111,7 @@ _DEFAULTS = {
         "power_line_frequency":     "1",
         "focus_autos":              "0",
         "focus_absolute":           "30",
+        "sharpness":                "128",
     },
 }
 
@@ -193,12 +194,149 @@ def apply_camera_settings():
     v4l2_set("gain",                      ct.get("gain", "100"))
     v4l2_set("brightness",                ct.get("brightness", "160"))
     v4l2_set("contrast",                  ct.get("contrast", "130"))
+    v4l2_set("sharpness",                 ct.get("sharpness", "128"))
     v4l2_set("saturation",                ct.get("saturation", "128"))
     v4l2_set("backlight_compensation",    ct.get("backlight_compensation", "1"))
     v4l2_set("power_line_frequency",      ct.get("power_line_frequency", "1"))
     # focus_autos in conf → focus_automatic_continuous in v4l2
     v4l2_set("focus_automatic_continuous", ct.get("focus_autos", "0"))
     v4l2_set("focus_absolute",            ct.get("focus_absolute", "30"))
+
+
+# ── Camera control panel ──────────────────────────────────────────────────────
+class CamPanel:
+    """
+    Overlay panel drawn on the camera frame for live v4l2 control.
+    Toggle with the CAM button in the top-right header bar.
+    Click [−] / [+] to adjust a value by one step; change is applied
+    immediately via v4l2-ctl (non-blocking Popen).
+    """
+
+    # (v4l2_ctrl_name,    display_label,  min,  max,  step)
+    CONTROLS = [
+        ("brightness",      "Brightness",   0,   255,   5),
+        ("contrast",        "Contrast",     0,   255,   5),
+        ("sharpness",       "Sharpness",    0,   255,   5),
+        ("focus_absolute",  "Focus",        0,   250,   5),
+        ("gain",            "ISO / Gain",   0,   255,   5),
+    ]
+
+    # Panel geometry (pixels)
+    _PW    = 215   # panel width
+    _PH    = 152   # panel height
+    _ROW_H = 24    # height of each control row
+    _PAD   = 8     # left padding for labels
+    _BW    = 16    # button width
+
+    # Config-driven defaults (shown un-highlighted when at default)
+    _DEFAULTS = {
+        "brightness":     160,
+        "contrast":       130,
+        "sharpness":      128,
+        "focus_absolute": 30,
+        "gain":           100,
+    }
+
+    def __init__(self, cfg: configparser.ConfigParser):
+        ct = cfg["camera_tuning"]
+        self.values: dict[str, int] = {
+            "brightness":     int(ct.get("brightness",     "160")),
+            "contrast":       int(ct.get("contrast",       "130")),
+            "sharpness":      int(ct.get("sharpness",      "128")),
+            "focus_absolute": int(ct.get("focus_absolute", "30")),
+            "gain":           int(ct.get("gain",           "100")),
+        }
+        self.visible = False
+        # Populated by draw(); maps (ctrl, "+" | "-") → (x1, y1, x2, y2)
+        self._btns: dict[tuple[str, str], tuple[int, int, int, int]] = {}
+
+    def toggle(self):
+        self.visible = not self.visible
+
+    # ── Apply a single control live ───────────────────────────────────────────
+    def _apply(self, ctrl: str, value: int):
+        dev = f"/dev/video{CAM_ID}"
+        subprocess.Popen(
+            ["v4l2-ctl", "-d", dev, f"--set-ctrl={ctrl}={value}"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+
+    # ── Mouse handling ────────────────────────────────────────────────────────
+    def handle_click(self, x: int, y: int) -> bool:
+        """Return True if click was consumed by the panel."""
+        if not self.visible:
+            return False
+        for (ctrl, sign), (x1, y1, x2, y2) in self._btns.items():
+            if x1 <= x <= x2 and y1 <= y <= y2:
+                for key, _, mn, mx, step in self.CONTROLS:
+                    if key == ctrl:
+                        delta = step if sign == "+" else -step
+                        self.values[ctrl] = max(mn, min(mx, self.values[ctrl] + delta))
+                        self._apply(ctrl, self.values[ctrl])
+                        return True
+        return False
+
+    # ── Draw ─────────────────────────────────────────────────────────────────
+    def draw(self, frame):
+        if not self.visible:
+            return
+        fh, fw = frame.shape[:2]
+        px = fw - self._PW - 2    # right-aligned, 2 px from edge
+        py = 30                   # just below header-button row
+
+        # Semi-transparent background
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (px, py), (px + self._PW, py + self._PH),
+                      (15, 15, 15), -1)
+        cv2.addWeighted(overlay, 0.80, frame, 0.20, 0, frame)
+
+        # Border + header
+        cv2.rectangle(frame, (px, py), (px + self._PW, py + self._PH),
+                      (70, 150, 70), 1)
+        cv2.putText(frame, "CAM CONTROLS",
+                    (px + self._PAD, py + 14),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, (90, 210, 90), 1)
+        cv2.line(frame,
+                 (px, py + 19), (px + self._PW, py + 19),
+                 (50, 100, 50), 1)
+
+        self._btns.clear()
+        for i, (ctrl, label, mn, mx, _) in enumerate(self.CONTROLS):
+            ry  = py + 26 + i * self._ROW_H
+            val = self.values[ctrl]
+
+            # Label
+            cv2.putText(frame, label,
+                        (px + self._PAD, ry + 13),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.37, (195, 195, 195), 1)
+
+            # [−] button
+            bm_x1, bm_x2 = px + 112, px + 112 + self._BW
+            bm_y1, bm_y2 = ry + 1, ry + self._ROW_H - 3
+            cv2.rectangle(frame, (bm_x1, bm_y1), (bm_x2, bm_y2), (55, 55, 115), -1)
+            cv2.rectangle(frame, (bm_x1, bm_y1), (bm_x2, bm_y2), (110, 110, 175), 1)
+            cv2.putText(frame, "-", (bm_x1 + 4, bm_y2 - 3),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 255), 1)
+            self._btns[(ctrl, "-")] = (bm_x1, bm_y1, bm_x2, bm_y2)
+
+            # Value (highlighted in amber when not at default)
+            at_default = (val == self._DEFAULTS.get(ctrl, -1))
+            val_col    = (175, 175, 175) if at_default else (80, 210, 255)
+            cv2.putText(frame, f"{val:3d}",
+                        (bm_x2 + 5, ry + 13),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.38, val_col, 1)
+
+            # [+] button
+            bp_x1, bp_x2 = bm_x2 + 36, bm_x2 + 36 + self._BW
+            bp_y1, bp_y2 = ry + 1, ry + self._ROW_H - 3
+            cv2.rectangle(frame, (bp_x1, bp_y1), (bp_x2, bp_y2), (25, 90, 25), -1)
+            cv2.rectangle(frame, (bp_x1, bp_y1), (bp_x2, bp_y2), (70, 165, 70), 1)
+            cv2.putText(frame, "+", (bp_x1 + 3, bp_y2 - 3),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (160, 240, 160), 1)
+            self._btns[(ctrl, "+")] = (bp_x1, bp_y1, bp_x2, bp_y2)
+
+
+_cam_panel = CamPanel(_cfg)
 
 # Raw Linux keycodes (input-event-codes.h).
 # KEY_LEFTMETA=125, KEY_LEFT=105, KEY_RIGHT=106, KEY_UP=103, KEY_DOWN=108
@@ -350,10 +488,11 @@ def play_startup_sound():
 _quit_flag              = [False]
 _btn_close: tuple | None = None   # (x1, y1, x2, y2) in frame pixels
 _btn_min:   tuple | None = None
+_btn_cam:   tuple | None = None   # CAM panel toggle button
 
 
 def _mouse_cb(event, x, y, flags, param):
-    """OpenCV mouse callback — handles ✕ (quit) and — (minimize) buttons."""
+    """OpenCV mouse callback — handles ✕ (quit), — (minimize), CAM panel."""
     if event != cv2.EVENT_LBUTTONDOWN:
         return
     if _btn_close and _btn_close[0] <= x <= _btn_close[2] and _btn_close[1] <= y <= _btn_close[3]:
@@ -363,11 +502,15 @@ def _mouse_cb(event, x, y, flags, param):
             ["wmctrl", "-r", ":ACTIVE:", "-b", "add,hidden"],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
+    elif _btn_cam and _btn_cam[0] <= x <= _btn_cam[2] and _btn_cam[1] <= y <= _btn_cam[3]:
+        _cam_panel.toggle()
+    else:
+        _cam_panel.handle_click(x, y)
 
 
 def draw_buttons(frame):
-    """Draw ✕ and — buttons top-right of frame; update _btn_close / _btn_min rects."""
-    global _btn_close, _btn_min
+    """Draw ✕, — and CAM buttons top-right; update their hit-rects."""
+    global _btn_close, _btn_min, _btn_cam
     h, w = frame.shape[:2]
     pad, bw, bh = 5, 24, 18
     # Close ✕
@@ -384,6 +527,16 @@ def draw_buttons(frame):
     cv2.rectangle(frame, (mx1, my1), (mx2, my2), (160, 160, 160), 1)
     cv2.putText(frame, "-", (mx1 + 8, my2 - 3),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.55, (220, 220, 220), 1)
+    # CAM toggle (wider button to fit label)
+    cam_w = 30
+    camx1, camy1 = mx1 - pad - cam_w, pad
+    camx2, camy2 = mx1 - pad, pad + bh
+    _btn_cam = (camx1, camy1, camx2, camy2)
+    cam_bg = (55, 130, 55) if _cam_panel.visible else (20, 50, 20)
+    cv2.rectangle(frame, (camx1, camy1), (camx2, camy2), cam_bg, -1)
+    cv2.rectangle(frame, (camx1, camy1), (camx2, camy2), (120, 180, 120), 1)
+    cv2.putText(frame, "CAM", (camx1 + 3, camy2 - 3),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.32, (200, 240, 200), 1)
 
 
 # ── Drawing helpers ───────────────────────────────────────────────────────────
@@ -757,6 +910,7 @@ def run():
                 flash_taskview=(now < taskview_flash_until),
                 flash_minimize=(now < minimize_flash_until),
             )
+            _cam_panel.draw(frame)
             draw_buttons(frame)
             cv2.imshow(win_name, frame)
 
