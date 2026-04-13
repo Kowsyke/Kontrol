@@ -359,6 +359,10 @@ def is_middle_thumb_pinched(lm) -> bool:
     return pinch_dist(lm, 4, 12) < PINCH_THRESHOLD
 
 
+def is_ring_thumb_pinched(lm) -> bool:
+    return pinch_dist(lm, 4, 16) < PINCH_THRESHOLD
+
+
 def is_pinky_thumb_pinched(lm) -> bool:
     return pinch_dist(lm, 4, 20) < PINCH_THRESHOLD
 
@@ -533,7 +537,7 @@ def draw_visibility_warning(frame, lm, fw: int, fh: int):
 
 
 def draw_hud(frame, locked: bool, gesture: str, fps: float,
-             pd_it: float, pd_mt: float, pd_pt: float,
+             pd_it: float, pd_mt: float, pd_rt: float, pd_pt: float,
              palm_count: int = 0,
              drag_active: bool = False,
              tile_held: bool = False,
@@ -562,7 +566,7 @@ def draw_hud(frame, locked: bool, gesture: str, fps: float,
         f"FPS     {fps:5.1f}",
         f"Mode    {mode_txt}",
         f"Gesture {gesture}",
-        f"I+T={pd_it:.3f}  M+T={pd_mt:.3f}  P+T={pd_pt:.3f}",
+        f"I+T={pd_it:.3f} M+T={pd_mt:.3f} R+T={pd_rt:.3f} P+T={pd_pt:.3f}",
     ]
     for i, txt in enumerate(lines):
         cv2.putText(frame, txt, (8, 18 + i * 18),
@@ -644,16 +648,19 @@ def run():
     flash_msg             = ""
     flash_until           = 0.0
 
-    # Index+Thumb — gesture 2 (right click)
+    # Index+Thumb — left click / drag
     it_pinch_held         = False
-    last_it_click_t       = 0.0
-
-    # Middle+Thumb — gestures 3+4 (left click / drag / scroll)
-    mt_pinch_held         = False
-    mt_pinch_start_t      = 0.0
+    it_pinch_start_t      = 0.0
     drag_active           = False
     last_drag_end_t       = 0.0
+
+    # Middle+Thumb — scroll only
+    mt_pinch_held         = False
     scroll_ref_y: float | None = None
+
+    # Ring+Thumb — right click
+    rt_pinch_held         = False
+    last_rt_click_t       = 0.0
 
     # Pinky+Thumb — gesture 5 (tile)
     pt_pinch_held         = False
@@ -667,7 +674,7 @@ def run():
     fps                   = 0.0
     fps_alpha             = 0.1
     last_frame_t          = time.time()
-    pd_it_hud = pd_mt_hud = pd_pt_hud = 1.0
+    pd_it_hud = pd_mt_hud = pd_rt_hud = pd_pt_hud = 1.0
 
     print(f"Kontrol v1.1  {SCREEN_W}x{SCREEN_H}"
           f"  zone=[{ZONE_X_MIN:.2f}-{ZONE_X_MAX:.2f}, {ZONE_Y_MIN:.2f}-{ZONE_Y_MAX:.2f}]"
@@ -711,6 +718,7 @@ def run():
 
                 pd_it_hud = pinch_dist(lm, 4, 8)
                 pd_mt_hud = pinch_dist(lm, 4, 12)
+                pd_rt_hud = pinch_dist(lm, 4, 16)
                 pd_pt_hud = pinch_dist(lm, 4, 20)
 
                 # ── Priority 1: Palm close ────────────────────────────────────
@@ -787,23 +795,21 @@ def run():
                         active_gesture = f"TILE-HOLD P+T={pd_pt_hud:.3f}"
                         was_gesturing  = True
 
-                    # ── Priority 4+5: Middle+Thumb — scroll / drag / click ────
+                    # ── Priority 4: Middle+Thumb — scroll only ───────────────
                     elif is_middle_thumb_pinched(lm):
                         tile_held_hud = False
                         if pt_pinch_held:
                             pt_pinch_held = False
 
                         if not mt_pinch_held:
-                            mt_pinch_held    = True
-                            mt_pinch_start_t = now
-                            scroll_ref_y     = lm[0].y
+                            mt_pinch_held = True
+                            scroll_ref_y  = lm[0].y
 
-                        # Per-frame wrist y delta for scroll
+                        # Per-frame wrist y delta — scroll only, no drag/click
                         dy_norm      = lm[0].y - scroll_ref_y
                         scroll_ref_y = lm[0].y
 
                         if abs(dy_norm) > SCROLL_DEADZONE:
-                            # Scroll mode — do NOT move cursor this frame
                             ticks = max(1, int(abs(dy_norm) * SCROLL_SPEED))
                             if dy_norm < 0:
                                 scroll_up(ticks)
@@ -811,16 +817,58 @@ def run():
                             else:
                                 scroll_down(ticks)
                                 active_gesture = f"SCROLL DN x{ticks}"
-                            was_gesturing = True
                         else:
-                            # Drag mode — cursor follows hand
-                            held_t = now - mt_pinch_start_t
+                            active_gesture = f"SCROLL M+T"
+                        was_gesturing = True
+
+                    else:
+                        # ── Release handlers (run before checking new gestures) ─
+                        if mt_pinch_held:
+                            mt_pinch_held = False
+                            scroll_ref_y  = None
+
+                        tile_held_hud = False
+                        if pt_pinch_held:
+                            pt_pinch_held = False
+
+                        # Index+Thumb release: drag end or quick left click
+                        if not is_index_thumb_pinched(lm) and it_pinch_held:
+                            if drag_active:
+                                mouse_up()
+                                drag_active     = False
+                                last_drag_end_t = now
+                            elif (now - it_pinch_start_t) < PINCH_COOLDOWN:
+                                if (now - last_drag_end_t) > PINCH_COOLDOWN:
+                                    left_click()
+                                    active_gesture = "L-CLICK"
+                            it_pinch_held = False
+
+                        # Ring+Thumb release
+                        if not is_ring_thumb_pinched(lm):
+                            rt_pinch_held = False
+
+                        # ── Priority 5: Ring+Thumb — right click ──────────────
+                        if is_ring_thumb_pinched(lm):
+                            if not rt_pinch_held and (now - last_rt_click_t) > PINCH_COOLDOWN:
+                                right_click()
+                                last_rt_click_t = now
+                                active_gesture  = f"R-CLICK R+T={pd_rt_hud:.3f}"
+                            rt_pinch_held = True
+                            was_gesturing = True
+
+                        # ── Priority 6: Index+Thumb — left click / drag ────────
+                        elif is_index_thumb_pinched(lm):
+                            if not it_pinch_held:
+                                it_pinch_held    = True
+                                it_pinch_start_t = now
+
+                            held_t = now - it_pinch_start_t
                             if held_t > PINCH_COOLDOWN and not drag_active:
                                 mouse_down()
                                 drag_active = True
 
                             if drag_active:
-                                active_gesture = f"DRAG M+T d={pd_mt_hud:.3f}"
+                                active_gesture = f"DRAG I+T d={pd_it_hud:.3f}"
                                 reentry = first_frame or was_gesturing
                                 (raw_x_s, raw_y_s, cx, cy, prev_tx, prev_ty,
                                  prev_sent_x, prev_sent_y) = _run_cursor_pipeline(
@@ -831,39 +879,10 @@ def run():
                                 )
                                 was_gesturing = False
                             else:
-                                active_gesture = f"PINCH M+T d={pd_mt_hud:.3f}"
+                                active_gesture = f"PINCH I+T d={pd_it_hud:.3f}"
                                 was_gesturing  = True
 
-                    else:
-                        # Middle+Thumb released — fire click or end drag
-                        if mt_pinch_held:
-                            if drag_active:
-                                mouse_up()
-                                drag_active     = False
-                                last_drag_end_t = now
-                            elif (now - mt_pinch_start_t) < PINCH_COOLDOWN:
-                                if (now - last_drag_end_t) > PINCH_COOLDOWN:
-                                    left_click()
-                                    active_gesture = "L-CLICK"
-                            mt_pinch_held = False
-                            scroll_ref_y  = None
-
-                        tile_held_hud = False
-                        if pt_pinch_held:
-                            pt_pinch_held = False
-
-                        # ── Priority 6: Index+Thumb — right click ─────────────
-                        if is_index_thumb_pinched(lm):
-                            if not it_pinch_held and (now - last_it_click_t) > PINCH_COOLDOWN:
-                                right_click()
-                                last_it_click_t = now
-                                active_gesture  = f"R-CLICK I+T={pd_it_hud:.3f}"
-                            it_pinch_held = True
-                            was_gesturing = True
-
                         else:
-                            it_pinch_held = False
-
                             # ── Cursor pipeline ───────────────────────────────
                             reentry = first_frame or was_gesturing
                             (raw_x_s, raw_y_s, cx, cy, prev_tx, prev_ty,
@@ -890,6 +909,7 @@ def run():
                     drag_active = False
                 mt_pinch_held    = False
                 it_pinch_held    = False
+                rt_pinch_held    = False
                 pt_pinch_held    = False
                 palm_hold_count  = 0
                 palm_was_closed  = False
@@ -901,7 +921,7 @@ def run():
 
             draw_hud(
                 frame, locked, active_gesture, fps,
-                pd_it_hud, pd_mt_hud, pd_pt_hud,
+                pd_it_hud, pd_mt_hud, pd_rt_hud, pd_pt_hud,
                 palm_count=palm_hold_count,
                 drag_active=drag_active,
                 tile_held=tile_held_hud,
