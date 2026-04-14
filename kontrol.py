@@ -4,7 +4,7 @@ Kontrol v1.3 — Hand gesture mouse control
 MediaPipe Tasks API (0.10+) → ydotool (no pynput, Wayland-safe)
 
 Gesture priority order (strict — higher number never fires if lower active):
-  1. Palm close  (hold palm_hold_frames, fire on RELEASE)    → minimize / restore
+  1. Bunch (all 5 tips together, hold ~0.6 s, fire on RELEASE) → minimize / restore
   2. Pinky+Thumb (LM 4+20) held + wrist direction            → KDE tile
   3. Peace sign  (index+middle up, ring+pinky folded) + swipe → task switcher
   4. Middle+Thumb (LM 4+12) + vertical wrist movement        → scroll
@@ -62,13 +62,14 @@ _DEFAULTS: dict[str, dict[str, str]] = {
         "pinch_cooldown":      "0.35",
         "scroll_deadzone":     "0.010",
         "scroll_speed":        "6.0",
-        "palm_hold_frames":    "20",
         "palm_cooldown":       "2.0",
         "tile_move_threshold":  "0.06",
         "tile_window_frames":   "8",
         "tile_cooldown":        "0.8",
         "task_move_threshold":  "0.06",
         "task_cooldown":        "0.5",
+        "bunch_threshold":      "0.10",
+        "bunch_hold_frames":    "12",
     },
     "detection": {
         "detection_confidence": "0.50",
@@ -131,8 +132,9 @@ PINCH_THRESHOLD    = _cfg.getfloat("gestures", "pinch_threshold")
 PINCH_COOLDOWN     = _cfg.getfloat("gestures", "pinch_cooldown")
 SCROLL_DEADZONE    = _cfg.getfloat("gestures", "scroll_deadzone")
 SCROLL_SPEED       = _cfg.getfloat("gestures", "scroll_speed")
-PALM_HOLD_FRAMES   = _cfg.getint("gestures",   "palm_hold_frames")
 PALM_COOLDOWN      = _cfg.getfloat("gestures", "palm_cooldown")
+BUNCH_THRESHOLD    = _cfg.getfloat("gestures", "bunch_threshold")   # all-tips proximity
+BUNCH_HOLD_FRAMES  = _cfg.getint("gestures",   "bunch_hold_frames") # frames to hold before fire
 TILE_THRESHOLD     = _cfg.getfloat("gestures", "tile_move_threshold")
 TILE_WINDOW        = _cfg.getint("gestures",   "tile_window_frames")
 TILE_COOLDOWN      = _cfg.getfloat("gestures", "tile_cooldown")
@@ -218,7 +220,7 @@ def pdist(lm, a: int, b: int) -> float:
 
 
 def is_index_thumb(lm) -> bool:
-    """LM 4 (thumb tip) + LM 8 (index tip) pinch → RIGHT CLICK."""
+    """LM 4 (thumb tip) + LM 8 (index tip) pinch → LEFT CLICK / DRAG."""
     return pdist(lm, 4, 8) < PINCH_THRESHOLD
 
 
@@ -254,14 +256,17 @@ def is_peace_sign(lm) -> bool:
     return index_up and middle_up and ring_down and pinky_down and no_pinch
 
 
-def is_palm_closed(lm) -> bool:
-    """All 5 fingertips below their base joints — full fist."""
+def is_bunch(lm) -> bool:
+    """
+    All 5 fingertips converge to a single point — thumb touches all other tips.
+    Like pinching all fingers together (Italian hand gesture / 'bunch').
+    Uses BUNCH_THRESHOLD (looser than PINCH_THRESHOLD — 4 simultaneous contacts).
+    """
     return (
-        lm[4].y  > lm[2].y  and   # thumb tip below IP joint
-        lm[8].y  > lm[5].y  and   # index tip below MCP joint
-        lm[12].y > lm[9].y  and   # middle tip below MCP joint
-        lm[16].y > lm[13].y and   # ring tip below MCP joint
-        lm[20].y > lm[17].y       # pinky tip below MCP joint
+        pdist(lm, 4, 8)  < BUNCH_THRESHOLD and   # thumb tip ↔ index tip
+        pdist(lm, 4, 12) < BUNCH_THRESHOLD and   # thumb tip ↔ middle tip
+        pdist(lm, 4, 16) < BUNCH_THRESHOLD and   # thumb tip ↔ ring tip
+        pdist(lm, 4, 20) < BUNCH_THRESHOLD        # thumb tip ↔ pinky tip
     )
 
 
@@ -413,9 +418,9 @@ def draw_hud(frame, gesture: str, fps: float,
     # Palm progress bar — only shown when palm is closing
     if palm_count > 0:
         BAR_W   = 10
-        filled  = min(palm_count * BAR_W // PALM_HOLD_FRAMES, BAR_W)
+        filled  = min(palm_count * BAR_W // BUNCH_HOLD_FRAMES, BAR_W)
         bar     = "\u2588" * filled + "\u2591" * (BAR_W - filled)
-        cv2.putText(frame, f"[PALM] {bar} {palm_count}/{PALM_HOLD_FRAMES}",
+        cv2.putText(frame, f"[PALM] {bar} {palm_count}/{BUNCH_HOLD_FRAMES}",
                     (x0, y0 + 4 * dy), font, 0.40, (0, 180, 255), 1)
 
     # ── Flash message — centred, large, 1.0 s ─────────────────────────────
@@ -626,9 +631,9 @@ def run() -> None:
     hand_was_present: bool = False         # was hand detected last frame?
     was_gesturing: bool    = False         # last frame ran a non-cursor gesture?
 
-    # ── GESTURE STATE — palm close (priority 1) ───────────────────────────────
-    palm_frames:     int   = 0      # consecutive frames fist held
-    palm_was_closed: bool  = False  # True while fist is held this sequence
+    # ── GESTURE STATE — bunch (all tips together, priority 1) ────────────────
+    palm_frames:     int   = 0      # consecutive frames bunch held
+    palm_was_closed: bool  = False  # True while bunch is held this sequence
     last_palm_t:     float = 0.0    # timestamp of last palm trigger
     palm_minimized:  bool  = False  # toggle: True=minimized, False=restored
 
@@ -675,7 +680,7 @@ def run() -> None:
         f"  cam=/dev/video{CAM_ID}"
         f"  zone=[{ZONE_X_MIN:.2f}-{ZONE_X_MAX:.2f}, {ZONE_Y_MIN:.2f}-{ZONE_Y_MAX:.2f}]"
         f"  lm={LANDMARK_SMOOTH}  smooth[{MIN_SMOOTH}-{MAX_SMOOTH}]x{VELOCITY_SCALE}"
-        f"  pinch={PINCH_THRESHOLD}  palm={PALM_HOLD_FRAMES}fr"
+        f"  pinch={PINCH_THRESHOLD}  bunch={BUNCH_THRESHOLD}/{BUNCH_HOLD_FRAMES}fr"
     )
 
     _last_ts_ms: int = 0   # VIDEO mode requires strictly increasing timestamps
@@ -727,10 +732,10 @@ def run() -> None:
                 task_wrist_xs.append(lm[0].x)
 
                 # ════════════════════════════════════════════════════════════════
-                # PRIORITY 1 — PALM CLOSE
-                # Blocks ALL other gestures. Fires on RELEASE after hold threshold.
+                # PRIORITY 1 — BUNCH (all 5 fingertips meet at one point)
+                # Blocks ALL other gestures. Fires minimize/restore on RELEASE.
                 # ════════════════════════════════════════════════════════════════
-                if is_palm_closed(lm):
+                if is_bunch(lm):
                     palm_frames    += 1
                     palm_was_closed = True
                     was_gesturing   = True
@@ -739,12 +744,12 @@ def run() -> None:
                         mouse_up()
                         drag_active = False
 
-                    active_gesture = f"PALM {palm_frames}/{PALM_HOLD_FRAMES}"
+                    active_gesture = f"PALM {palm_frames}/{BUNCH_HOLD_FRAMES}"
 
                 else:
                     # Palm released — fire if held long enough
                     if palm_was_closed:
-                        if (palm_frames >= PALM_HOLD_FRAMES
+                        if (palm_frames >= BUNCH_HOLD_FRAMES   # held long enough
                                 and (now - last_palm_t) > PALM_COOLDOWN):
                             if palm_minimized:
                                 # Restore: Meta+PgUp (KEY_PAGEUP=104)
