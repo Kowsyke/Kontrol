@@ -1,5 +1,96 @@
 # Kontrol CHANGELOG v2
 
+## v1.2 — clean architecture, corrected gesture map, new HUD (session 3)
+
+### Architecture changes
+- `kontrol.py` restructured into strict sections: Imports → Config → Constants →
+  ydotool helpers → Landmark helpers → Camera → Draw functions → Cursor pipeline → run()
+- All constants derived from config, named in ALL_CAPS — no magic numbers
+- Every non-obvious landmark index annotated with its anatomical meaning
+- Every ydotool call annotated with what it does in KDE
+
+### Camera
+- `apply_camera_settings()`: added `time.sleep(0.3)` before first apply (let UVC settle)
+- Two-pass confirmed: pass 1 before warm-up reads, pass 2 after VIDIOC_STREAMON reset
+- Brightness verification print on startup: `[CAM] brightness mean: X.X (target >80)`
+- **Device confirmed: `/dev/video0`** — no video2 exists (built-in disabled via udev)
+- `_DEFAULTS` camera id fixed: was `"2"` (bug), now `"0"` (matches runtime conf)
+
+### Gesture map — CORRECTED (v1.1 code had wrong finger assignments)
+
+| Priority | Gesture | Landmark pair | Action |
+|---|---|---|---|
+| 1 | Palm close | all 5 curled | minimize / restore toggle (Meta+Down) |
+| 2 | Pinky+Thumb hold + move | LM 4+20 | KDE tile (Meta+direction) |
+| 3 | Middle+Thumb + vertical move | LM 4+12 | scroll up/down |
+| 4 | Middle+Thumb stationary | LM 4+12 | left click / drag |
+| 5 | Index+Thumb | LM 4+8 | right click |
+| 6 | Index tip (LM 8) | — | cursor (5-stage EMA pipeline) |
+
+**Bug fixes from v1.1 code:**
+- Index+Thumb was left click/drag → corrected to right click
+- Ring+Thumb was right click → removed entirely (ring_thumb_pinched dead code purged)
+- Middle+Thumb was scroll-only → now click/drag/scroll (scroll wins when wrist moves)
+- `locked` state existed, was never set True — dead code removed
+- Tile history now cleared on pinky+thumb entry (prevents stale pre-pinch movement)
+- Palm restore key was Meta+PgUp (104) → corrected to Meta+Down (108) — toggle both ways
+
+### Cursor pipeline (unchanged from v1.1 — was correct)
+- Stage 1: landmark pre-smooth (α=0.35, fixed)
+- Stage 2: zone mapping [0.15–0.85 x, 0.10–0.90 y] → screen pixels
+- Stage 3: velocity (screen px/frame) → adaptive alpha
+- Stage 4: velocity-adaptive EMA (min=0.06, max=0.40, scale=4.0)
+- Stage 5: integer delta, 2px deadzone, Popen fire-and-forget
+- Re-entry: snaps cx/cy on first_frame or was_gesturing, sends no delta
+
+### HUD rewrite
+- Border: red=no hand, orange=palm closing, blue=drag, yellow=tile hold, green=tracking
+- Panel lines: `[FPS]`, `[HAND]`, `[GESTURE]`, `[PINCH] I= M= P=` (removed Ring column)
+- Palm bar: shown only when palm_frames > 0
+- Flash messages: MINIMIZE, RESTORE, TILE UP/DOWN/LEFT/RIGHT — 1.0 s duration
+- Fingertip markers: red circle on LM 8 (index+thumb), blue on LM 12 (middle+thumb),
+  yellow on LM 20 (pinky+thumb) — only when respective pinch is active
+- Zone warnings: text arrows when LM 8 within 5% of zone boundary
+- CamPanel removed (complexity not justified by spec)
+- Buttons: [—] minimize + [✕] quit only (CAM button removed)
+
+### kontrol.conf — final values
+
+| Section | Key | Value |
+|---|---|---|
+| screen | width / height | 4480 / 1440 |
+| camera | id / flip | 0 / true |
+| mapping | zone_x | 0.15 – 0.85 |
+| mapping | zone_y | 0.10 – 0.90 |
+| smoothing | landmark_smooth | 0.35 |
+| smoothing | min/max_smooth | 0.06 / 0.40 |
+| smoothing | velocity_scale | 4.0 |
+| smoothing | cursor_deadzone_px | 2 |
+| gestures | pinch_threshold | 0.055 |
+| gestures | pinch_cooldown | 0.35 |
+| gestures | scroll_deadzone | 0.010 |
+| gestures | scroll_speed | 6.0 |
+| gestures | palm_hold_frames | 20 |
+| gestures | palm_cooldown | 2.0 |
+| gestures | tile_move_threshold | 0.06 |
+| gestures | tile_window_frames | 8 |
+| gestures | tile_cooldown | 0.8 |
+| camera_tuning | auto_exposure | 1 |
+| camera_tuning | exposure_time_absolute | 300 |
+| camera_tuning | gain | 100 |
+| camera_tuning | brightness | 160 |
+
+### Known issues / deferred
+- Palm key (Meta+Down = KEY_DOWN = 108): toggles minimize/restore in KDE with some
+  tiling managers. If your WM uses different shortcuts, update `[KEY_DOWN=108]` references
+  in the gesture priority chain directly.
+- CamPanel removed — if live brightness tuning is needed, re-add from v1.1.
+- Performance numbers: not yet measured (no [PERF] timing run conducted this session).
+  Run with `_dt > 0.045` print to collect; expected <30 ms per frame on i5-8250U.
+- Tests T01–T37 not yet formally verified — session produced code, not live run.
+
+---
+
 ## v1.1 — smooth cursor + full gesture map (session 2)
 
 ### Cursor pipeline (complete rewrite)
