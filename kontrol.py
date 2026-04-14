@@ -213,6 +213,35 @@ def tiling_key(direction: str) -> None:
         ydocall("key", *seq, blocking=True)   # Meta+direction → KDE tile
 
 
+# ── FOCUS GUARD ───────────────────────────────────────────────────────────────
+# Prevents clicks landing on the Kontrol preview window itself.
+# If they do, KDE shows its window-operations context menu which captures the
+# X event loop and freezes cv2.waitKey. Cached so xprop runs at most 4×/sec.
+_focus_cache: list = [0.0, False]   # [checked_at_monotonic, was_kontrol_active]
+
+
+def _kontrol_is_active(win_name: str) -> bool:
+    """True if the Kontrol window is the active X window. Cached 0.25 s."""
+    now = time.monotonic()
+    if now - _focus_cache[0] < 0.25:
+        return _focus_cache[1]
+    try:
+        r1 = subprocess.run(
+            ["xprop", "-root", "_NET_ACTIVE_WINDOW"],
+            capture_output=True, text=True, timeout=0.05,
+        )
+        wid = r1.stdout.strip().split()[-1]
+        r2 = subprocess.run(
+            ["xprop", "-id", wid, "WM_NAME"],
+            capture_output=True, text=True, timeout=0.05,
+        )
+        _focus_cache[1] = win_name in r2.stdout
+    except Exception:
+        _focus_cache[1] = False
+    _focus_cache[0] = now
+    return _focus_cache[1]
+
+
 # ── LANDMARK HELPERS (pure, no side effects) ─────────────────────────────────
 def pdist(lm, a: int, b: int) -> float:
     """Normalised Euclidean distance between two landmarks."""
@@ -875,7 +904,8 @@ def run() -> None:
                                 if is_ring_thumb(lm):
                                     if not rt_held \
                                             and (now - last_rclick_t) > PINCH_COOLDOWN:
-                                        right_click()   # right button down+up
+                                        if not _kontrol_is_active(win_name):
+                                            right_click()   # right button down+up
                                         last_rclick_t  = now
                                         active_gesture = f"R-CLICK  R={pd_rt:.3f}"
                                     rt_held       = True
@@ -896,8 +926,9 @@ def run() -> None:
                                         held_t = now - it_start_t
                                         if held_t > PINCH_COOLDOWN and not drag_active \
                                                 and (now - last_drag_end_t) > PINCH_COOLDOWN:
-                                            mouse_down()   # left button down → drag starts
-                                            drag_active = True
+                                            if not _kontrol_is_active(win_name):
+                                                mouse_down()   # left button down → drag starts
+                                                drag_active = True
 
                                         if drag_active:
                                             # Cursor moves during drag
@@ -927,8 +958,9 @@ def run() -> None:
                                             elif (now - it_start_t) < PINCH_COOLDOWN \
                                                     and (now - last_drag_end_t) > PINCH_COOLDOWN:
                                                 # Quick tap: send click (down then up)
-                                                mouse_down()
-                                                mouse_up()
+                                                if not _kontrol_is_active(win_name):
+                                                    mouse_down()
+                                                    mouse_up()
                                                 active_gesture = "L-CLICK"
                                             it_held = False
 
