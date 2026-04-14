@@ -747,24 +747,24 @@ def run() -> None:
                     active_gesture = f"PALM {palm_frames}/{BUNCH_HOLD_FRAMES}"
 
                 else:
-                    # Palm released — fire if held long enough
+                    # Bunch released — fire if held long enough
                     if palm_was_closed:
-                        if (palm_frames >= BUNCH_HOLD_FRAMES   # held long enough
+                        if (palm_frames >= BUNCH_HOLD_FRAMES
                                 and (now - last_palm_t) > PALM_COOLDOWN):
-                            if palm_minimized:
-                                # Restore: Meta+PgUp (KEY_PAGEUP=104)
-                                ydocall("key", "125:1", "104:1", "104:0", "125:0",
-                                        blocking=True)
-                                palm_minimized = False
-                                flash_msg      = "RESTORE"
-                            else:
-                                # Minimize: Meta+PgDown (KEY_PAGEDOWN=109)
-                                ydocall("key", "125:1", "109:1", "109:0", "125:0",
-                                        blocking=True)
-                                palm_minimized = True
-                                flash_msg      = "MINIMIZE"
-                            flash_until = now + 1.0
-                            last_palm_t = now
+                            # KDE "Show Desktop" — built-in toggle:
+                            # first call hides all windows, second restores them.
+                            subprocess.run(
+                                ["qdbus", "org.kde.kglobalaccel",
+                                 "/component/kwin",
+                                 "org.kde.kglobalaccel.Component.invokeShortcut",
+                                 "Show Desktop"],
+                                env=os.environ,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                            )
+                            palm_minimized = not palm_minimized
+                            flash_msg      = "SHOW DESKTOP" if palm_minimized else "RESTORE"
+                            flash_until    = now + 1.0
+                            last_palm_t    = now
                         palm_frames     = 0
                         palm_was_closed = False
 
