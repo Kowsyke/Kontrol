@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 """
-Kontrol v1.2 — Hand gesture mouse control
+Kontrol v1.3 — Hand gesture mouse control
 MediaPipe Tasks API (0.10+) → ydotool (no pynput, Wayland-safe)
 
 Gesture priority order (strict — higher number never fires if lower active):
-  1. Palm close (hold palm_hold_frames, fire on RELEASE) → minimize / restore toggle
-  2. Pinky+Thumb (LM 4+20) held + wrist direction       → KDE window tiling
-  3. Middle+Thumb (LM 4+12) pinch + vertical movement   → scroll
-  4. Middle+Thumb (LM 4+12) pinch hold/tap              → drag / left click
-  5. Index+Thumb  (LM 4+8)  pinch                       → right click
-  6. Index fingertip (LM 8) — 5-stage EMA pipeline      → cursor
+  1. Palm close  (hold palm_hold_frames, fire on RELEASE)    → minimize / restore
+  2. Pinky+Thumb (LM 4+20) held + wrist direction            → KDE tile
+  3. Peace sign  (index+middle up, ring+pinky folded) + swipe → task switcher
+  4. Middle+Thumb (LM 4+12) + vertical wrist movement        → scroll
+  5. Ring+Thumb  (LM 4+16)                                   → right click
+  6. Index+Thumb (LM 4+8)  hold/tap                          → drag / left click
+  7. Index fingertip (LM 8) — 5-stage EMA pipeline           → cursor
 
 Config: kontrol.conf (INI format, same directory)
 Launch: cd /home/K/Storage/Projects/Kontrol && ./run.sh
@@ -63,9 +64,11 @@ _DEFAULTS: dict[str, dict[str, str]] = {
         "scroll_speed":        "6.0",
         "palm_hold_frames":    "20",
         "palm_cooldown":       "2.0",
-        "tile_move_threshold": "0.06",
-        "tile_window_frames":  "8",
-        "tile_cooldown":       "0.8",
+        "tile_move_threshold":  "0.06",
+        "tile_window_frames":   "8",
+        "tile_cooldown":        "0.8",
+        "task_move_threshold":  "0.06",
+        "task_cooldown":        "0.5",
     },
     "detection": {
         "detection_confidence": "0.50",
@@ -133,6 +136,8 @@ PALM_COOLDOWN      = _cfg.getfloat("gestures", "palm_cooldown")
 TILE_THRESHOLD     = _cfg.getfloat("gestures", "tile_move_threshold")
 TILE_WINDOW        = _cfg.getint("gestures",   "tile_window_frames")
 TILE_COOLDOWN      = _cfg.getfloat("gestures", "tile_cooldown")
+TASK_THRESHOLD     = _cfg.getfloat("gestures", "task_move_threshold")
+TASK_COOLDOWN      = _cfg.getfloat("gestures", "task_cooldown")
 
 DETECTION_CONF     = _cfg.getfloat("detection", "detection_confidence")
 PRESENCE_CONF      = _cfg.getfloat("detection", "presence_confidence")
@@ -145,6 +150,8 @@ FRAME_INTERVAL     = 1.0 / TARGET_FPS
 
 # Raw Linux keycodes (input-event-codes.h)
 # KEY_LEFTMETA=125  KEY_UP=103  KEY_DOWN=108  KEY_LEFT=105  KEY_RIGHT=106
+# KEY_PAGEUP=104    KEY_PAGEDOWN=109
+# KEY_LEFTALT=56    KEY_TAB=15  KEY_LEFTSHIFT=42
 _TILING_KEYS: dict[str, tuple[str, ...]] = {
     "right": ("125:1", "106:1", "106:0", "125:0"),  # Meta+Right
     "left":  ("125:1", "105:1", "105:0", "125:0"),  # Meta+Left
@@ -220,9 +227,31 @@ def is_middle_thumb(lm) -> bool:
     return pdist(lm, 4, 12) < PINCH_THRESHOLD
 
 
+def is_ring_thumb(lm) -> bool:
+    """LM 4 (thumb tip) + LM 16 (ring tip) pinch → RIGHT CLICK."""
+    return pdist(lm, 4, 16) < PINCH_THRESHOLD
+
+
 def is_pinky_thumb(lm) -> bool:
     """LM 4 (thumb tip) + LM 20 (pinky tip) pinch → TILE."""
     return pdist(lm, 4, 20) < PINCH_THRESHOLD
+
+
+def is_peace_sign(lm) -> bool:
+    """
+    Index (LM 8) + middle (LM 12) extended upward; ring (LM 16) + pinky (LM 20)
+    folded; no thumb pinch active. → TASK SWITCHER swipe.
+    """
+    index_up   = lm[8].y  < lm[5].y    # index tip above index MCP
+    middle_up  = lm[12].y < lm[9].y    # middle tip above middle MCP
+    ring_down  = lm[16].y > lm[13].y   # ring tip below ring MCP
+    pinky_down = lm[20].y > lm[17].y   # pinky tip below pinky MCP
+    # Thumb must not be pinching — avoids conflict with any pinch gesture
+    no_pinch   = (pdist(lm, 4, 8)  > PINCH_THRESHOLD and
+                  pdist(lm, 4, 12) > PINCH_THRESHOLD and
+                  pdist(lm, 4, 16) > PINCH_THRESHOLD and
+                  pdist(lm, 4, 20) > PINCH_THRESHOLD)
+    return index_up and middle_up and ring_down and pinky_down and no_pinch
 
 
 def is_palm_closed(lm) -> bool:
@@ -289,18 +318,22 @@ def draw_skeleton(frame, lm, fw: int, fh: int) -> None:
 
 def draw_fingertip_markers(frame, lm, fw: int, fh: int,
                             it_pinched: bool, mt_pinched: bool,
-                            pt_pinched: bool) -> None:
+                            rt_pinched: bool, pt_pinched: bool) -> None:
     """Coloured circles on active pinch fingertips."""
     if it_pinched:
-        # index tip (LM 8) — red when index+thumb pinched
+        # index tip (LM 8) — green when index+thumb pinched (left click)
         cv2.circle(frame, (int(lm[8].x * fw), int(lm[8].y * fh)),
-                   12, (0, 0, 220), -1)
+                   12, (0, 200, 0), -1)
     if mt_pinched:
-        # middle tip (LM 12) — blue when middle+thumb pinched
+        # middle tip (LM 12) — blue when middle+thumb pinched (scroll)
         cv2.circle(frame, (int(lm[12].x * fw), int(lm[12].y * fh)),
                    12, (200, 80, 0), -1)
+    if rt_pinched:
+        # ring tip (LM 16) — red when ring+thumb pinched (right click)
+        cv2.circle(frame, (int(lm[16].x * fw), int(lm[16].y * fh)),
+                   12, (0, 0, 220), -1)
     if pt_pinched:
-        # pinky tip (LM 20) — yellow when pinky+thumb pinched
+        # pinky tip (LM 20) — yellow when pinky+thumb pinched (tile)
         cv2.circle(frame, (int(lm[20].x * fw), int(lm[20].y * fh)),
                    12, (0, 220, 220), -1)
 
@@ -327,7 +360,7 @@ def draw_zone_warning(frame, lm, fw: int, fh: int) -> None:
 
 
 def draw_hud(frame, gesture: str, fps: float,
-             pd_it: float, pd_mt: float, pd_pt: float,
+             pd_it: float, pd_mt: float, pd_rt: float, pd_pt: float,
              palm_count: int = 0,
              drag_active: bool = False,
              tile_held: bool = False,
@@ -359,7 +392,7 @@ def draw_hud(frame, gesture: str, fps: float,
 
     # ── Status panel — translucent dark background ─────────────────────────
     overlay = frame.copy()
-    cv2.rectangle(overlay, (0, 0), (205, 108), (10, 10, 10), -1)
+    cv2.rectangle(overlay, (0, 0), (260, 108), (10, 10, 10), -1)
     cv2.addWeighted(overlay, 0.65, frame, 0.35, 0, frame)
 
     # ── HUD text lines ────────────────────────────────────────────────────────
@@ -375,7 +408,7 @@ def draw_hud(frame, gesture: str, fps: float,
     hud_line(0, "[FPS]    ", f"{fps:5.1f}")
     hud_line(1, "[HAND]   ", "DETECTED" if hand_detected else "NO HAND")
     hud_line(2, "[GESTURE]", gesture)
-    hud_line(3, "[PINCH]  ", f"I={pd_it:.3f}  M={pd_mt:.3f}  P={pd_pt:.3f}")
+    hud_line(3, "[PINCH]  ", f"I={pd_it:.3f} M={pd_mt:.3f} R={pd_rt:.3f} P={pd_pt:.3f}")
 
     # Palm progress bar — only shown when palm is closing
     if palm_count > 0:
@@ -577,7 +610,7 @@ def run() -> None:
 
     play_startup_sound()
 
-    win_name = "Kontrol v1.2"
+    win_name = "Kontrol v1.3"
     cv2.namedWindow(win_name)
     cv2.setMouseCallback(win_name, _mouse_cb)
 
@@ -594,28 +627,36 @@ def run() -> None:
     was_gesturing: bool    = False         # last frame ran a non-cursor gesture?
 
     # ── GESTURE STATE — palm close (priority 1) ───────────────────────────────
-    palm_frames:    int   = 0      # consecutive frames fist held
-    palm_was_closed: bool = False  # True while fist is held this sequence
-    last_palm_t:    float = 0.0    # timestamp of last palm trigger
-    palm_minimized: bool  = False  # True = window was minimized
+    palm_frames:     int   = 0      # consecutive frames fist held
+    palm_was_closed: bool  = False  # True while fist is held this sequence
+    last_palm_t:     float = 0.0    # timestamp of last palm trigger
+    palm_minimized:  bool  = False  # toggle: True=minimized, False=restored
 
     # ── GESTURE STATE — pinky+thumb tiling (priority 2) ──────────────────────
-    pt_held:       bool  = False              # pinky+thumb currently pinched?
-    tile_wrist_xs: deque = deque(maxlen=TILE_WINDOW)  # wrist x history
-    tile_wrist_ys: deque = deque(maxlen=TILE_WINDOW)  # wrist y history
-    tile_fired:    bool  = False   # True = tile already sent this hold
+    pt_held:       bool  = False                       # pinky+thumb currently pinched?
+    tile_wrist_xs: deque = deque(maxlen=TILE_WINDOW)   # wrist x history
+    tile_wrist_ys: deque = deque(maxlen=TILE_WINDOW)   # wrist y history
+    tile_fired:    bool  = False   # True = tile already fired this hold
     last_tile_t:   float = 0.0    # timestamp of last tile fire
 
-    # ── GESTURE STATE — middle+thumb left click / drag / scroll (priority 3+4) ─
-    mt_held:        bool        = False   # middle+thumb currently pinched?
-    drag_active:    bool        = False   # left button currently held down?
-    drag_start_t:   float       = 0.0    # timestamp when drag started
-    last_drag_end_t: float      = 0.0    # timestamp when last drag ended
-    scroll_ref_y: float | None  = None   # wrist y reference for scroll delta
+    # ── GESTURE STATE — peace sign task switcher (priority 3) ─────────────────
+    peace_held:     bool  = False                      # peace sign currently held?
+    task_wrist_xs:  deque = deque(maxlen=8)            # wrist x history for swipe
+    last_task_t:    float = 0.0    # timestamp of last task switch
 
-    # ── GESTURE STATE — index+thumb right click (priority 5) ─────────────────
-    it_held:       bool  = False   # index+thumb currently pinched?
+    # ── GESTURE STATE — middle+thumb scroll (priority 4) ─────────────────────
+    mt_held:      bool        = False   # middle+thumb currently pinched?
+    scroll_ref_y: float | None = None   # wrist y reference for per-frame delta
+
+    # ── GESTURE STATE — ring+thumb right click (priority 5) ───────────────────
+    rt_held:       bool  = False   # ring+thumb currently pinched?
     last_rclick_t: float = 0.0    # timestamp of last right click
+
+    # ── GESTURE STATE — index+thumb left click / drag (priority 6) ───────────
+    it_held:         bool  = False   # index+thumb currently pinched?
+    it_start_t:      float = 0.0    # timestamp when index+thumb pinch started
+    drag_active:     bool  = False   # left mouse button currently held?
+    last_drag_end_t: float = 0.0    # timestamp when last drag released
 
     # ── HUD / PERF STATE ──────────────────────────────────────────────────────
     active_gesture: str   = "NONE"
@@ -624,12 +665,13 @@ def run() -> None:
     fps:            float = 0.0
     fps_alpha:      float = 0.1    # EMA alpha for FPS display smoothing
     last_frame_t:   float = time.time()
-    pd_it: float = 1.0   # index+thumb distance (for HUD)
-    pd_mt: float = 1.0   # middle+thumb distance (for HUD)
-    pd_pt: float = 1.0   # pinky+thumb distance (for HUD)
+    pd_it: float = 1.0   # index+thumb distance display
+    pd_mt: float = 1.0   # middle+thumb distance display
+    pd_rt: float = 1.0   # ring+thumb distance display
+    pd_pt: float = 1.0   # pinky+thumb distance display
 
     print(
-        f"Kontrol v1.2  {SCREEN_W}x{SCREEN_H}"
+        f"Kontrol v1.3  {SCREEN_W}x{SCREEN_H}"
         f"  cam=/dev/video{CAM_ID}"
         f"  zone=[{ZONE_X_MIN:.2f}-{ZONE_X_MAX:.2f}, {ZONE_Y_MIN:.2f}-{ZONE_Y_MAX:.2f}]"
         f"  lm={LANDMARK_SMOOTH}  smooth[{MIN_SMOOTH}-{MAX_SMOOTH}]x{VELOCITY_SCALE}"
@@ -670,61 +712,66 @@ def run() -> None:
             if result.hand_landmarks:
                 lm = result.hand_landmarks[0]   # single hand always at index 0
 
-                first_frame       = not hand_was_present
-                hand_was_present  = True
+                first_frame      = not hand_was_present
+                hand_was_present = True
 
                 # Update pinch distances for HUD every frame
                 pd_it = pdist(lm, 4, 8)    # index+thumb
                 pd_mt = pdist(lm, 4, 12)   # middle+thumb
+                pd_rt = pdist(lm, 4, 16)   # ring+thumb
                 pd_pt = pdist(lm, 4, 20)   # pinky+thumb
 
-                # Wrist history for tile — always append (before priority chain)
+                # Wrist history — always append before any priority check
                 tile_wrist_xs.append(lm[0].x)   # LM 0 = wrist
                 tile_wrist_ys.append(lm[0].y)
+                task_wrist_xs.append(lm[0].x)
 
                 # ════════════════════════════════════════════════════════════════
                 # PRIORITY 1 — PALM CLOSE
-                # Blocks ALL other gestures while fist is held.
-                # Fires on RELEASE after PALM_HOLD_FRAMES consecutive frames.
+                # Blocks ALL other gestures. Fires on RELEASE after hold threshold.
                 # ════════════════════════════════════════════════════════════════
                 if is_palm_closed(lm):
                     palm_frames    += 1
                     palm_was_closed = True
                     was_gesturing   = True
 
-                    # Safety: never leave left button stuck during palm gesture
-                    if drag_active:
+                    if drag_active:          # never leave button stuck
                         mouse_up()
                         drag_active = False
 
                     active_gesture = f"PALM {palm_frames}/{PALM_HOLD_FRAMES}"
 
                 else:
-                    # Palm released — check if it was held long enough to fire
+                    # Palm released — fire if held long enough
                     if palm_was_closed:
                         if (palm_frames >= PALM_HOLD_FRAMES
                                 and (now - last_palm_t) > PALM_COOLDOWN):
-                            # Meta+Down toggles minimize/restore in KDE
-                            ydocall("key", "125:1", "108:1", "108:0", "125:0",
-                                    blocking=True)
-                            palm_minimized = not palm_minimized
-                            flash_msg      = "RESTORE" if not palm_minimized else "MINIMIZE"
-                            flash_until    = now + 1.0
-                            last_palm_t    = now
+                            if palm_minimized:
+                                # Restore: Meta+PgUp (KEY_PAGEUP=104)
+                                ydocall("key", "125:1", "104:1", "104:0", "125:0",
+                                        blocking=True)
+                                palm_minimized = False
+                                flash_msg      = "RESTORE"
+                            else:
+                                # Minimize: Meta+PgDown (KEY_PAGEDOWN=109)
+                                ydocall("key", "125:1", "109:1", "109:0", "125:0",
+                                        blocking=True)
+                                palm_minimized = True
+                                flash_msg      = "MINIMIZE"
+                            flash_until = now + 1.0
+                            last_palm_t = now
                         palm_frames     = 0
                         palm_was_closed = False
 
                     # ════════════════════════════════════════════════════════════
                     # PRIORITY 2 — PINKY+THUMB → TILE
-                    # Track wrist displacement while pinched; fire on threshold.
                     # ════════════════════════════════════════════════════════════
                     if is_pinky_thumb(lm):
                         active_gesture = f"TILE HOLD  P={pd_pt:.3f}"
                         was_gesturing  = True
 
                         if not pt_held:
-                            # Entry: clear history — don't include pre-pinch movement
-                            tile_wrist_xs.clear()
+                            tile_wrist_xs.clear()   # discard pre-pinch history
                             tile_wrist_ys.clear()
                             tile_fired = False
                         pt_held = True
@@ -736,12 +783,11 @@ def run() -> None:
 
                             if (adx > TILE_THRESHOLD or ady > TILE_THRESHOLD) \
                                     and (now - last_tile_t) > TILE_COOLDOWN:
-                                if adx > ady:
-                                    direction = "right" if dx_total > 0 else "left"
-                                else:
-                                    direction = "down" if dy_total > 0 else "up"
-
-                                tiling_key(direction)   # Meta+direction → KDE tile
+                                direction = (
+                                    ("right" if dx_total > 0 else "left") if adx > ady
+                                    else ("down" if dy_total > 0 else "up")
+                                )
+                                tiling_key(direction)   # Meta+direction
                                 tile_fired     = True
                                 last_tile_t    = now
                                 flash_msg      = f"TILE {direction.upper()}"
@@ -751,99 +797,158 @@ def run() -> None:
                                 tile_wrist_ys.clear()
 
                     else:
-                        # Pinky+thumb released
                         if pt_held:
-                            tile_fired = False   # reset for next hold
+                            tile_fired = False
                             pt_held    = False
 
                         # ════════════════════════════════════════════════════════
-                        # PRIORITY 3+4 — MIDDLE+THUMB → SCROLL or CLICK/DRAG
-                        # Scroll takes priority when wrist moves vertically.
-                        # Click/drag fires when wrist is stationary.
+                        # PRIORITY 3 — PEACE SIGN (index+middle up, rest folded)
+                        #              + WRIST SWIPE → TASK SWITCHER
+                        # Alt+Tab (next) or Alt+Shift+Tab (prev). Repeatable.
                         # ════════════════════════════════════════════════════════
-                        if is_middle_thumb(lm):
-                            was_gesturing = True
+                        if is_peace_sign(lm):
+                            active_gesture = "TASK SWITCH"
+                            was_gesturing  = True
 
-                            if not mt_held:
-                                mt_held      = True
-                                scroll_ref_y = lm[0].y   # LM 0 = wrist y reference
+                            if not peace_held:
+                                task_wrist_xs.clear()   # discard pre-gesture history
+                                peace_held = True
 
-                            dy_norm      = lm[0].y - scroll_ref_y   # per-frame wrist delta
-                            scroll_ref_y = lm[0].y
-
-                            if abs(dy_norm) > SCROLL_DEADZONE:
-                                # SCROLL — suppress cursor and click while moving
-                                ticks   = max(1, int(abs(dy_norm) * SCROLL_SPEED))
-                                wheel_y = -ticks if dy_norm < 0 else ticks
-                                ydocall("mousemove", "--wheel",
-                                        "-x", "0", "-y", str(wheel_y))
-                                active_gesture = f"SCROLL {'UP' if dy_norm < 0 else 'DOWN'} x{ticks}"
-
-                            else:
-                                # CLICK or DRAG — wrist stationary
-                                if not drag_active and (now - last_drag_end_t) > PINCH_COOLDOWN:
-                                    mouse_down()         # left button down
-                                    drag_active  = True
-                                    drag_start_t = now
-
-                                # Cursor moves normally during drag
-                                reentry = first_frame or was_gesturing
-                                (raw_x_s, raw_y_s, cx, cy, prev_tx, prev_ty,
-                                 prev_sent_x, prev_sent_y) = run_cursor_pipeline(
-                                    lm, raw_x_s, raw_y_s,
-                                    cx, cy, prev_tx, prev_ty,
-                                    prev_sent_x, prev_sent_y,
-                                    reentry=reentry,
-                                )
-                                was_gesturing  = False
-                                active_gesture = "DRAG" if drag_active else "L-CLICK"
+                            if len(task_wrist_xs) >= 2 \
+                                    and (now - last_task_t) > TASK_COOLDOWN:
+                                dx = task_wrist_xs[-1] - task_wrist_xs[0]
+                                if abs(dx) > TASK_THRESHOLD:
+                                    if dx > 0:
+                                        # Swipe right → next task: Alt+Tab
+                                        ydocall("key", "56:1", "15:1", "15:0", "56:0",
+                                                blocking=True)
+                                        active_gesture = "TASK →"
+                                    else:
+                                        # Swipe left → prev task: Alt+Shift+Tab
+                                        ydocall("key", "56:1", "42:1", "15:1",
+                                                "15:0", "42:0", "56:0", blocking=True)
+                                        active_gesture = "TASK ←"
+                                    last_task_t = now
+                                    task_wrist_xs.clear()   # ready for next swipe
 
                         else:
-                            # Middle+thumb released
-                            if mt_held:
-                                mt_held      = False
-                                scroll_ref_y = None   # reset scroll reference
-
-                                if drag_active:
-                                    mouse_up()          # left button up
-                                    drag_active     = False
-                                    last_drag_end_t = now
+                            if peace_held:
+                                peace_held = False
+                                task_wrist_xs.clear()
 
                             # ════════════════════════════════════════════════════
-                            # PRIORITY 5 — INDEX+THUMB → RIGHT CLICK
-                            # Single fire per pinch entry; cooldown between fires.
+                            # PRIORITY 4 — MIDDLE+THUMB → SCROLL
                             # ════════════════════════════════════════════════════
-                            if is_index_thumb(lm):
-                                if not it_held and (now - last_rclick_t) > PINCH_COOLDOWN:
-                                    right_click()         # right click (down+up)
-                                    last_rclick_t  = now
-                                    active_gesture = f"R-CLICK  I={pd_it:.3f}"
-                                it_held       = True
+                            if is_middle_thumb(lm):
                                 was_gesturing = True
 
+                                if not mt_held:
+                                    mt_held      = True
+                                    scroll_ref_y = lm[0].y   # wrist y anchor
+
+                                dy_norm      = lm[0].y - scroll_ref_y
+                                scroll_ref_y = lm[0].y
+
+                                if abs(dy_norm) > SCROLL_DEADZONE:
+                                    ticks   = max(1, int(abs(dy_norm) * SCROLL_SPEED))
+                                    wheel_y = -ticks if dy_norm < 0 else ticks
+                                    ydocall("mousemove", "--wheel",
+                                            "-x", "0", "-y", str(wheel_y))
+                                    active_gesture = f"SCROLL {'UP' if dy_norm < 0 else 'DOWN'} x{ticks}"
+                                else:
+                                    active_gesture = f"SCROLL HOLD  M={pd_mt:.3f}"
+
                             else:
-                                it_held = False   # reset on index+thumb release
+                                if mt_held:
+                                    mt_held      = False
+                                    scroll_ref_y = None
 
                                 # ════════════════════════════════════════════════
-                                # PRIORITY 6 (default) — CURSOR
-                                # Runs when no gesture is active.
+                                # PRIORITY 5 — RING+THUMB → RIGHT CLICK
+                                # Single fire per entry; cooldown guards repeat.
                                 # ════════════════════════════════════════════════
-                                reentry = first_frame or was_gesturing
-                                (raw_x_s, raw_y_s, cx, cy, prev_tx, prev_ty,
-                                 prev_sent_x, prev_sent_y) = run_cursor_pipeline(
-                                    lm, raw_x_s, raw_y_s,
-                                    cx, cy, prev_tx, prev_ty,
-                                    prev_sent_x, prev_sent_y,
-                                    reentry=reentry,
-                                )
-                                active_gesture = "CURSOR"
-                                was_gesturing  = False
+                                if is_ring_thumb(lm):
+                                    if not rt_held \
+                                            and (now - last_rclick_t) > PINCH_COOLDOWN:
+                                        right_click()   # right button down+up
+                                        last_rclick_t  = now
+                                        active_gesture = f"R-CLICK  R={pd_rt:.3f}"
+                                    rt_held       = True
+                                    was_gesturing = True
+
+                                else:
+                                    rt_held = False
+
+                                    # ════════════════════════════════════════════
+                                    # PRIORITY 6 — INDEX+THUMB → LEFT CLICK / DRAG
+                                    # Quick tap → click. Hold > cooldown → drag.
+                                    # ════════════════════════════════════════════
+                                    if is_index_thumb(lm):
+                                        if not it_held:
+                                            it_held   = True
+                                            it_start_t = now
+
+                                        held_t = now - it_start_t
+                                        if held_t > PINCH_COOLDOWN and not drag_active \
+                                                and (now - last_drag_end_t) > PINCH_COOLDOWN:
+                                            mouse_down()   # left button down → drag starts
+                                            drag_active = True
+
+                                        if drag_active:
+                                            # Cursor moves during drag
+                                            reentry = first_frame or was_gesturing
+                                            (raw_x_s, raw_y_s, cx, cy,
+                                             prev_tx, prev_ty,
+                                             prev_sent_x, prev_sent_y) = \
+                                                run_cursor_pipeline(
+                                                    lm, raw_x_s, raw_y_s,
+                                                    cx, cy, prev_tx, prev_ty,
+                                                    prev_sent_x, prev_sent_y,
+                                                    reentry=reentry,
+                                                )
+                                            was_gesturing  = False
+                                            active_gesture = f"DRAG  I={pd_it:.3f}"
+                                        else:
+                                            was_gesturing  = True
+                                            active_gesture = f"PINCH  I={pd_it:.3f}"
+
+                                    else:
+                                        # Index+thumb released — complete the click/drag
+                                        if it_held:
+                                            if drag_active:
+                                                mouse_up()          # left button up
+                                                drag_active     = False
+                                                last_drag_end_t = now
+                                            elif (now - it_start_t) < PINCH_COOLDOWN \
+                                                    and (now - last_drag_end_t) > PINCH_COOLDOWN:
+                                                # Quick tap: send click (down then up)
+                                                mouse_down()
+                                                mouse_up()
+                                                active_gesture = "L-CLICK"
+                                            it_held = False
+
+                                        # ════════════════════════════════════════
+                                        # PRIORITY 7 (default) — CURSOR
+                                        # ════════════════════════════════════════
+                                        reentry = first_frame or was_gesturing
+                                        (raw_x_s, raw_y_s, cx, cy,
+                                         prev_tx, prev_ty,
+                                         prev_sent_x, prev_sent_y) = \
+                                            run_cursor_pipeline(
+                                                lm, raw_x_s, raw_y_s,
+                                                cx, cy, prev_tx, prev_ty,
+                                                prev_sent_x, prev_sent_y,
+                                                reentry=reentry,
+                                            )
+                                        active_gesture = "CURSOR"
+                                        was_gesturing  = False
 
                 draw_skeleton(frame, lm, fw_px, fh_px)
                 draw_fingertip_markers(
                     frame, lm, fw_px, fh_px,
                     it_pinched=is_index_thumb(lm),
                     mt_pinched=is_middle_thumb(lm),
+                    rt_pinched=is_ring_thumb(lm),
                     pt_pinched=is_pinky_thumb(lm),
                 )
                 draw_zone_warning(frame, lm, fw_px, fh_px)
@@ -851,24 +956,27 @@ def run() -> None:
             else:
                 # ── HAND LOST ─────────────────────────────────────────────────
                 if hand_was_present:
-                    raw_x_s = raw_y_s = None   # cursor pipeline re-snaps on next entry
+                    raw_x_s = raw_y_s = None
                     hand_was_present = False
 
                 if drag_active:
                     mouse_up()   # never leave left button stuck
                     drag_active = False
 
-                # Reset all gesture state
-                mt_held      = False
-                it_held      = False
-                pt_held      = False
-                scroll_ref_y = None
-                palm_frames  = 0
+                # Reset all transient gesture state
+                it_held         = False
+                rt_held         = False
+                mt_held         = False
+                pt_held         = False
+                peace_held      = False
+                scroll_ref_y    = None
+                palm_frames     = 0
                 palm_was_closed = False
                 tile_wrist_xs.clear()
                 tile_wrist_ys.clear()
+                task_wrist_xs.clear()
                 tile_fired     = False
-                was_gesturing  = True   # force re-entry snap when hand returns
+                was_gesturing  = True   # force re-entry snap on next hand detection
                 active_gesture = "NO HAND"
 
             draw_hud(
@@ -877,6 +985,7 @@ def run() -> None:
                 fps           = fps,
                 pd_it         = pd_it,
                 pd_mt         = pd_mt,
+                pd_rt         = pd_rt,
                 pd_pt         = pd_pt,
                 palm_count    = palm_frames,
                 drag_active   = drag_active,
