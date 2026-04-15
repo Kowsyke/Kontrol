@@ -926,9 +926,8 @@ def run() -> None:
                                         held_t = now - it_start_t
                                         if held_t > PINCH_COOLDOWN and not drag_active \
                                                 and (now - last_drag_end_t) > PINCH_COOLDOWN:
-                                            if not _kontrol_is_active(win_name):
-                                                mouse_down()   # left button down → drag starts
-                                                drag_active = True
+                                            mouse_down()   # left button down → drag starts
+                                            drag_active = True
 
                                         if drag_active:
                                             # Cursor moves during drag
@@ -958,9 +957,8 @@ def run() -> None:
                                             elif (now - it_start_t) < PINCH_COOLDOWN \
                                                     and (now - last_drag_end_t) > PINCH_COOLDOWN:
                                                 # Quick tap: send click (down then up)
-                                                if not _kontrol_is_active(win_name):
-                                                    mouse_down()
-                                                    mouse_up()
+                                                mouse_down()
+                                                mouse_up()
                                                 active_gesture = "L-CLICK"
                                             it_held = False
 
