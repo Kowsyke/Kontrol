@@ -1,5 +1,90 @@
 # Kontrol CHANGELOG v2
 
+## v1.3 — adaptive detection, landmark smoothing, styled HUD (session 4)
+
+### Detection phases (MISSION 1 — Sensing)
+- Switched from `RunningMode.VIDEO` to `RunningMode.IMAGE` to enable hot-reload
+- `build_detector(detect_t, presence_t, track_t)` factory function
+- Two-phase system: **SEARCHING** (high thresholds) → **LOCKED** (lower thresholds)
+  - SEARCHING: detection=0.75, presence=0.75, tracking=0.65
+  - LOCKED:    detection=0.60, presence=0.60, tracking=0.50
+  - Lock trigger: 3 consecutive detection frames
+  - Unlock trigger: 5 consecutive miss frames (tolerates brief occlusion)
+- Hot-reload on phase transition (~50 ms): old detector closed, new one built
+- Phase transitions logged to terminal: `[PHASE] → LOCKED` / `[PHASE] → SEARCHING`
+
+### Landmark smoothing (MISSION 1 — S4/S5)
+- `smooth_landmarks(lm, alpha)` — EMA applied to indices [0,4,5,8,9,12,13,16,17,20]
+- Module-level `_smooth_lm` dict reset on hand loss via `reset_smooth()`
+- All gesture detectors updated to use `pdist_s(slm, a, b)` on smoothed coords
+- Allows pinch threshold tightened from 0.055 → **0.048** (pre-smoothed input)
+- Bunch/palm detection (`is_bunch_s`) uses smoothed landmarks
+- Wrist reference for tile/scroll uses `slm[0]` (smoothed wrist)
+
+### Tile gesture — absolute delta (MISSION 3 — P3)
+- Old: tracked wrist delta history over sliding window (8 frames)
+- New: record `tile_start_x/y` on pinch entry; measure absolute displacement
+- Fires once per pinch hold when displacement exceeds `tile_move_threshold=0.050`
+- Eliminates stale-history false fires; direction is unambiguous from entry point
+- Removed `tile_window_frames` state (no longer needed)
+
+### Scroll velocity EMA (MISSION 3 — P2)
+- Old: raw `dy_norm * SCROLL_SPEED` per frame (tremor → single-tick jitter)
+- New: `scroll_vel` smoothed with `SCROLL_VEL_ALPHA=0.30`
+- Ticks clamped: `max(1, int(abs(scroll_vel) * SCROLL_SPEED))` up to `scroll_max_ticks=8`
+- `scroll_vel` reset to 0.0 on scroll gesture exit
+- Result: slow hand = 1 tick, fast hand = up to 8 ticks, tremor = no scroll
+
+### Palm countdown feedback (MISSION 3 — P4)
+- Terminal print at halfway (frame 10/20): `[PALM] halfway — keep closed`
+- Terminal print at trigger (frame 20/20): `[PALM] firing`
+- `play_palm_beep()`: descending two-tone (600 Hz → 400 Hz, 80 ms each) via aplay
+- `palm_beep_fired` flag — beep plays exactly once per bunch hold sequence
+
+### HUD redesign (MISSION 2 — UI)
+- `draw_panel()`: semi-transparent dark background (alpha=0.55) for all HUD text
+- `draw_progress_bar()`: proper filled/track bar with border for palm countdown
+- `draw_skeleton()`: styled — grey connections, grey joints, white wrist ring,
+  green-highlighted index tip (cursor controller), active pinch ring overlays
+- `draw_detection_phase()`: top-right corner indicator
+  - LOCKED: solid green dot + "LOCK" label
+  - SEARCHING: pulsing grey dot (sin wave, 4 Hz) + "SRCH" label
+- `draw_zone_warning()`: now uses smoothed `slm[8]` instead of raw `lm[8].x/y`
+- `draw_buttons()`: hover-aware (brightens on cursor hover) via `_mouse_xy` state
+- HUD rows: FPS (colour-coded), HAND (phase), MODE, ACT (bold yellow when active),
+  PIN (I/M/P distances, green when active), PALM (progress bar, orange→green)
+- Flash messages: centred with drop shadow, 1.5 s for palm, 0.8 s for tile
+
+### kontrol.conf changes
+| Section | Key | Old | New |
+|---|---|---|---|
+| detection | detection_confidence | 0.50 | replaced by search/locked pairs |
+| gestures | pinch_threshold | 0.055 | **0.048** |
+| gestures | scroll_deadzone | 0.010 | **0.008** |
+| gestures | tile_move_threshold | 0.06 | **0.050** |
+| gestures | scroll_vel_alpha | — | 0.30 (new) |
+| gestures | scroll_max_ticks | — | 8 (new) |
+| gestures | palm_hold_frames | bunch_hold_frames=12 | **20** |
+| gestures | tile_window_frames | 8 | removed |
+| camera_tuning | sharpness | 128 | removed (not all cameras support) |
+
+### Test suite (MISSION 4) — to be run live
+37 tests across detection, cursor, gesture, conflict, UI, performance categories.
+See session prompt for full test list. Live run required — code not auto-tested.
+
+### Performance targets (not yet measured — live run required)
+- Target: mean <30 ms, p95 <45 ms, max <80 ms
+- IMAGE mode removes timestamp overhead vs VIDEO mode
+- All ydotool calls remain Popen (fire-and-forget) except blocking key sequences
+
+### Deferred to v1.4
+- Frame timing audit (P1) — `statistics` profiling block — add/collect/remove live
+- Formal 37-test pass/fail table — requires live session with camera
+- Adaptive smooth alpha per-gesture (palm vs cursor could use different α)
+- `is_peace_sign` still uses raw landmarks (low priority — pose not distance)
+
+---
+
 ## v1.2 — clean architecture, corrected gesture map, new HUD (session 3)
 
 ### Architecture changes
