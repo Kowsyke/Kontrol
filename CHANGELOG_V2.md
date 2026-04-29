@@ -1,5 +1,114 @@
 # Kontrol CHANGELOG v2
 
+## v1.4 — three-finger pinch, TouchDesigner skeleton, KWin D-Bus (session 5)
+
+### Three-finger pinch gesture (MISSION 1 — gesture-agent)
+- `is_three_finger_pinch(lm, thresh)`: Thumb (LM4) within thresh of BOTH index (LM8)
+  AND middle (LM12) simultaneously — distinguishes from individual two-finger pinches
+- Threshold: `three_finger_threshold = 0.058` (PINCH_THRESHOLD + 0.010, slightly looser)
+- Priority 3 in chain — before middle+thumb scroll (three-finger is a superset of middle+thumb;
+  must detect first or middle+thumb fires instead)
+- Fires once on pinch entry with 1.5 s cooldown — does NOT repeat while held
+- State: `three_finger_held`, `last_three_finger_t`
+- HUD: magenta border (220, 50, 220) when active; flash "TASK VIEW" in magenta 1.0 s
+- HUD PIN line now shows: `I= M= 3F= / P= R=` (3F = min(i_dist, m_dist))
+
+### KWin D-Bus integration (MISSION 3 — kwin-agent)
+- `kwin_dbus_available()`: checks `/component/kwin` on startup
+- Confirmed available on this KDE version ✓
+- `kwin_call(shortcut_name)`: invokes via `org.kde.kglobalaccel.Component.invokeShortcut`
+- `fire_kwin(action)`: D-Bus first, keycode fallback
+- **Confirmed KWin shortcut names on this KDE 6 install:**
+  - Tile right:  `Window Quick Tile Right`
+  - Tile left:   `Window Quick Tile Left`
+  - Tile up:     `Window Quick Tile Top`
+  - Tile down:   `Window Quick Tile Bottom`
+  - Maximize:    `Window Maximize`
+  - Minimize:    `Window Minimize`
+  - Overview:    `Overview`
+  - Show Desktop:`Show Desktop`
+- NOTE: `slotWindowQuickTile*` methods do NOT exist in this KDE version.
+  The `/KWin` D-Bus interface only exposes showDesktop, queryWindowInfo etc.
+  Correct path is `/component/kwin` with `invokeShortcut`.
+- All tile gestures now route through `fire_kwin(direction)` instead of raw `tiling_key()`
+- Three-finger pinch fires `fire_kwin("task_view")` → "Overview" effect
+
+### TouchDesigner-style skeleton (MISSION 2 — viz-agent)
+- Full rewrite of `draw_skeleton()` — `draw_fingertip_markers()` removed (integrated)
+- Per-finger colour coding: thumb=purple, index=blue, middle=green, ring=cyan, pinky=orange, wrist=white
+- 21 connections including palm cross-connections: (5,9),(9,13),(13,17),(5,17)
+- Depth-scaled dots via `lm_radius(lm, i, base, scale)`: `lm[i].z * 4` → larger when closer
+- Fingertip highlight rings: outer ring +4px on tips (4,8,12,16,20)
+- Dynamic pinch lines (4↔8, 4↔12, 4↔20): interpolate grey→colour, 1px→4px as dist decreases
+- Three-finger magenta triangle: drawn via `cv2.polylines` when gesture active
+- 'n' key: toggle `SHOW_LM_NUMBERS` — draws index labels (0–20) on each dot
+- 'i' key: toggle `SHOW_LM_INFO` — coordinate overlay for key landmarks (wrist, 5 tips)
+  showing normalised x,y,z values
+
+### Tile gesture — absolute delta (inherited from v1.3 design)
+- Records `tile_start_x/y` on pinch entry; measures absolute displacement from that point
+- `tile_wrist_xs/ys` deque removed; no longer needed
+- Fires once per pinch hold when displacement > `tile_move_threshold = 0.050`
+
+### Scroll velocity EMA
+- `scroll_vel` smoothed with `SCROLL_VEL_ALPHA = 0.30`
+- Ticks: `max(1, min(SCROLL_MAX_TICKS, int(abs(scroll_vel) * SCROLL_SPEED)))`
+- `scroll_vel` reset to 0.0 on middle+thumb release and hand loss
+
+### kontrol.conf changes
+| Section | Key | Old | New |
+|---|---|---|---|
+| gestures | pinch_threshold | 0.055 | **0.048** |
+| gestures | three_finger_threshold | — | 0.058 (new) |
+| gestures | three_finger_cooldown | — | 1.5 (new) |
+| gestures | scroll_deadzone | 0.010 | **0.008** |
+| gestures | scroll_vel_alpha | — | 0.30 (new) |
+| gestures | scroll_max_ticks | — | 8 (new) |
+| gestures | tile_window_frames | 8 | removed |
+
+### Test suite (MISSION 5 — tester-agent) — requires live run with camera
+**Gesture tests:**
+- [ ] N01: Three-finger pinch → KDE Overview opens
+- [ ] N02: Three-finger fires once per hold (no repeat)
+- [ ] N03: Cooldown: cannot fire twice in 1.5 s
+- [ ] N04: Three-finger does NOT trigger middle+thumb scroll
+- [ ] N05: Three-finger does NOT trigger right click
+- [ ] N06: Release three-finger → cursor resumes
+
+**Visualization tests:**
+- [ ] V01: All 21 dots visible
+- [ ] V02: Each finger different colour
+- [ ] V03: Closer joints appear larger
+- [ ] V04: Palm cross-connections drawn
+- [ ] V05: Pinch lines between thumb and each fingertip
+- [ ] V06: Pinch line brightens and thickens when close
+- [ ] V07: Three-finger magenta triangle when active
+- [ ] V08: 'n' → landmark numbers appear
+- [ ] V09: 'n' again → numbers disappear
+- [ ] V10: 'i' → coordinate overlay appears
+
+**KWin D-Bus tests:**
+- [ ] K01: Startup prints `[KWIN] D-Bus available ✓`
+- [ ] K02: Tile right → window tiles right
+- [ ] K03: Tile left → window tiles left
+- [ ] K04: Task view → Overview opens
+- [ ] K05: Minimize → Show Desktop fires
+
+**Regression tests:**
+- [ ] R01: Cursor smooth, no lag
+- [ ] R02: Hand re-entry no jump
+- [ ] R03: Scroll velocity works
+- [ ] R04: Palm progress bar fills
+- [ ] R05: Pinch threshold 0.048 — not too sensitive
+
+### Deferred to v1.5
+- Live test pass/fail table (requires camera session)
+- Adaptive detection phases (SEARCHING/LOCKED) — reverted in v1.3, deferred again
+- Peace sign still uses raw landmarks (low priority, pose not distance)
+- Landmark smoothing layer (pdist_s / slm) — reverted in v1.3, deferred again
+
+---
+
 ## v1.3 — adaptive detection, landmark smoothing, styled HUD (session 4)
 
 ### Detection phases (MISSION 1 — Sensing)
