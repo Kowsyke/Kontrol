@@ -7,7 +7,7 @@ Gesture priority order (strict — higher number never fires if lower active):
   1. Bunch (all 5 tips together, hold ~1 s, fire on RELEASE) → Show Desktop
   2. Pinky+Thumb (LM 4+20) held + wrist direction            → KDE tile
   3. Three-finger pinch (Thumb+Index+Middle, LM 4+8+12)      → KDE Overview
-  4. Peace sign  (index+middle up, ring+pinky folded) + swipe → Alt+Tab task switch
+  4. Wrist rotation CW/CCW (knuckle axis angle velocity)      → Alt+Tab / Shift+Alt+Tab
   5. Middle+Thumb (LM 4+12) + vertical wrist movement        → scroll
   6. Ring+Thumb  (LM 4+16)                                   → right click
   7. Index+Thumb (LM 4+8)  hold/tap                          → drag / left click
@@ -63,8 +63,9 @@ _DEFAULTS: dict[str, dict[str, str]] = {
         "bunch_hold_frames":      "12",
         "tile_move_threshold":    "0.050",
         "tile_cooldown":          "0.8",
-        "task_move_threshold":    "0.06",
-        "task_cooldown":          "0.5",
+        "rotation_threshold":  "1.8",
+        "rotation_cooldown":   "0.6",
+        "rotation_min_frames": "8",
     },
     "detection": {
         "detection_confidence": "0.50",
@@ -127,8 +128,6 @@ BUNCH_THRESHOLD       = _cfg.getfloat("gestures", "bunch_threshold")
 BUNCH_HOLD_FRAMES     = _cfg.getint("gestures",   "bunch_hold_frames")
 TILE_THRESHOLD        = _cfg.getfloat("gestures", "tile_move_threshold")
 TILE_COOLDOWN         = _cfg.getfloat("gestures", "tile_cooldown")
-TASK_THRESHOLD        = _cfg.getfloat("gestures", "task_move_threshold")
-TASK_COOLDOWN         = _cfg.getfloat("gestures", "task_cooldown")
 
 DETECTION_CONF = _cfg.getfloat("detection", "detection_confidence")
 PRESENCE_CONF  = _cfg.getfloat("detection", "presence_confidence")
@@ -311,16 +310,11 @@ def is_three_finger_pinch(lm, thresh: float) -> bool:
     return pdist(lm, 4, 8) < thresh and pdist(lm, 4, 12) < thresh
 
 
-def is_peace_sign(lm) -> bool:
-    index_up   = lm[8].y  < lm[5].y
-    middle_up  = lm[12].y < lm[9].y
-    ring_down  = lm[16].y > lm[13].y
-    pinky_down = lm[20].y > lm[17].y
-    no_pinch   = (pdist(lm, 4, 8)  > PINCH_THRESHOLD and
-                  pdist(lm, 4, 12) > PINCH_THRESHOLD and
-                  pdist(lm, 4, 16) > PINCH_THRESHOLD and
-                  pdist(lm, 4, 20) > PINCH_THRESHOLD)
-    return index_up and middle_up and ring_down and pinky_down and no_pinch
+def knuckle_angle(lm) -> float:
+    """Angle of knuckle axis LM17→LM5 in radians. CW rotation → angle decreases."""
+    dx = lm[5].x - lm[17].x
+    dy = lm[5].y - lm[17].y
+    return math.atan2(dy, dx)
 
 
 def is_bunch(lm) -> bool:
@@ -702,10 +696,12 @@ def run() -> None:
     three_finger_held:   bool  = False
     last_three_finger_t: float = 0.0
 
-    # ── GESTURE STATE — peace sign (priority 4) ───────────────────────────────
-    peace_held:    bool  = False
-    task_wrist_xs: deque = deque(maxlen=8)
-    last_task_t:   float = 0.0
+    # ── GESTURE STATE — wrist rotation (priority 4) ──────────────────────────
+    rot_angle_history: deque = deque(maxlen=12)
+    rot_last_fired_t:  float = 0.0
+    ROT_THRESHOLD:     float = _cfg.getfloat("gestures", "rotation_threshold")
+    ROT_COOLDOWN:      float = _cfg.getfloat("gestures", "rotation_cooldown")
+    ROT_MIN_FRAMES:    int   = _cfg.getint("gestures",   "rotation_min_frames")
 
     # ── GESTURE STATE — middle+thumb scroll (priority 5) ─────────────────────
     mt_held:      bool         = False
@@ -786,7 +782,7 @@ def run() -> None:
                 pd_pt = pdist(lm, 4, 20)
                 pd_3f = min(pd_it, pd_mt)
 
-                task_wrist_xs.append(lm[0].x)
+                rot_angle_history.append((now, knuckle_angle(lm)))
 
                 # ════════════════════════════════════════════════════════════
                 # PRIORITY 1 — BUNCH → SHOW DESKTOP
@@ -880,36 +876,60 @@ def run() -> None:
                             three_finger_held = False
 
                             # ════════════════════════════════════════════════
-                            # PRIORITY 4 — PEACE SIGN → ALT+TAB
+                            # PRIORITY 4 — WRIST ROTATION → ALT+TAB
                             # ════════════════════════════════════════════════
-                            if is_peace_sign(lm):
-                                active_gesture = "TASK SWITCH"
-                                was_gesturing  = True
+                            rotation_direction = None
 
-                                if not peace_held:
-                                    task_wrist_xs.clear()
-                                    peace_held = True
+                            if len(rot_angle_history) >= ROT_MIN_FRAMES:
+                                t_old, a_old = rot_angle_history[0]
+                                t_new, a_new = rot_angle_history[-1]
+                                rot_dt = t_new - t_old
 
-                                if len(task_wrist_xs) >= 2 \
-                                        and (now - last_task_t) > TASK_COOLDOWN:
-                                    dx = task_wrist_xs[-1] - task_wrist_xs[0]
-                                    if abs(dx) > TASK_THRESHOLD:
-                                        if dx > 0:
-                                            ydocall("key", "56:1", "15:1", "15:0", "56:0",
-                                                    blocking=True)
-                                            active_gesture = "TASK →"
-                                        else:
-                                            ydocall("key", "56:1", "42:1", "15:1",
-                                                    "15:0", "42:0", "56:0", blocking=True)
-                                            active_gesture = "TASK ←"
-                                        last_task_t = now
-                                        task_wrist_xs.clear()
+                                if rot_dt > 0.05:
+                                    raw_delta = a_new - a_old
+                                    if raw_delta > math.pi:
+                                        raw_delta -= 2 * math.pi
+                                    elif raw_delta < -math.pi:
+                                        raw_delta += 2 * math.pi
+
+                                    ang_vel = raw_delta / rot_dt
+
+                                    if abs(ang_vel) > ROT_THRESHOLD:
+                                        rotation_direction = "CW" if ang_vel < 0 else "CCW"
+
+                            if rotation_direction is not None:
+                                if (now - rot_last_fired_t) > ROT_COOLDOWN:
+                                    if rotation_direction == "CW":
+                                        subprocess.run(
+                                            ["ydotool", "key",
+                                             "56:1", "15:1", "15:0", "56:0"],
+                                            env=os.environ,
+                                            stdout=subprocess.DEVNULL,
+                                            stderr=subprocess.DEVNULL,
+                                        )
+                                        flash_msg      = "ALT+TAB →"
+                                        flash_color    = (200, 200, 50)
+                                        flash_until    = now + 0.6
+                                        active_gesture = "ROT CW → ALT+TAB"
+                                    else:
+                                        subprocess.run(
+                                            ["ydotool", "key",
+                                             "42:1", "56:1", "15:1", "15:0", "42:0", "56:0"],
+                                            env=os.environ,
+                                            stdout=subprocess.DEVNULL,
+                                            stderr=subprocess.DEVNULL,
+                                        )
+                                        flash_msg      = "← ALT+TAB"
+                                        flash_color    = (200, 200, 50)
+                                        flash_until    = now + 0.6
+                                        active_gesture = "ROT CCW ← ALT+TAB"
+
+                                    rot_last_fired_t = now
+                                    rot_angle_history.clear()
+
+                                was_gesturing = True
 
                             else:
-                                if peace_held:
-                                    peace_held = False
-                                    task_wrist_xs.clear()
-
                                 # ════════════════════════════════════════════
                                 # PRIORITY 5 — MIDDLE+THUMB → SCROLL
                                 # ════════════════════════════════════════════
@@ -1023,6 +1043,10 @@ def run() -> None:
                 draw_zone_warning(frame, lm, fw_px, fh_px)
                 if SHOW_LM_INFO:
                     draw_lm_info(frame, lm, fw_px, fh_px)
+                    angle_deg = math.degrees(knuckle_angle(lm))
+                    cv2.putText(frame, f"[ROT] {angle_deg:+.1f}°",
+                                (max(0, fw_px - 200), 112),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.28, (180, 220, 255), 1)
 
             else:
                 if hand_was_present:
@@ -1037,13 +1061,12 @@ def run() -> None:
                 rt_held           = False
                 mt_held           = False
                 pt_held           = False
-                peace_held        = False
                 three_finger_held = False
                 scroll_ref_y      = None
                 scroll_vel        = 0.0
                 palm_frames       = 0
                 palm_was_closed   = False
-                task_wrist_xs.clear()
+                rot_angle_history.clear()
                 tile_fired        = False
                 was_gesturing     = True
                 active_gesture    = "NO HAND"
