@@ -1,5 +1,48 @@
 # Kontrol CHANGELOG v2
 
+## v1.5 — wrist rotation replaces peace sign → Alt+Tab (session 6)
+
+### Removed: peace sign gesture
+- Deleted `is_peace_sign()` function and all associated state/constants
+- Removed: `peace_held`, `task_wrist_xs`, `last_task_t` state variables
+- Removed: `TASK_THRESHOLD`, `TASK_COOLDOWN` constants and `task_move_threshold`,
+  `task_cooldown` config keys
+
+### Added: wrist rotation gesture (priority 4)
+- `knuckle_angle(lm)`: computes angle of knuckle axis LM17 (pinky MCP) → LM5 (index MCP)
+  using `atan2(dy, dx)`, returns radians in `[-π, π]`
+- Clockwise real-world rotation → angle decreases over time (frame is flipped)
+- History: `rot_angle_history` deque (maxlen=12, ≈0.6 s at 20 fps)
+- Every detected frame: `(now, knuckle_angle(lm))` appended before priority chain
+- Angular velocity: `(a_new - a_old) / dt` after unwrapping ±π boundary
+- `ang_vel < 0` → CW → `ydotool key 56:1 15:1 15:0 56:0` (Alt+Tab forward)
+- `ang_vel > 0` → CCW → `ydotool key 42:1 56:1 15:1 15:0 42:0 56:0` (Shift+Alt+Tab backward)
+- Fires once per rotation: `rot_angle_history.clear()` after fire prevents rapid repeat
+- Cooldown `rot_last_fired_t` prevents re-trigger within `rotation_cooldown` seconds
+- When `rotation_direction is not None` but on cooldown: `was_gesturing = True` still set
+  (prevents cursor firing during partial rotation)
+- When no rotation detected: falls through to priorities 5–8 unchanged
+
+### Debug overlay
+- With `SHOW_LM_INFO` on (press `i`): `[ROT] {angle}°` line appears below landmark table
+  showing live knuckle axis angle in degrees
+
+### kontrol.conf [gestures] changes
+| Key | Old | New |
+|---|---|---|
+| task_move_threshold | 0.06 | removed |
+| task_cooldown | 0.5 | removed |
+| rotation_threshold | — | 1.8 (rad/s, between normal <0.5 and deliberate 2–5) |
+| rotation_cooldown | — | 0.6 s |
+| rotation_min_frames | — | 8 frames (≈0.4 s history before evaluating) |
+
+### Calibration notes
+- Initial threshold: 1.8 rad/s — raise to 2.5 if false positives during normal cursor use,
+  lower to 1.2 if hard to trigger deliberately
+- Raise `rotation_cooldown` to 0.8–1.0 if fires multiple times per rotation
+
+---
+
 ## v1.4 — three-finger pinch, TouchDesigner skeleton, KWin D-Bus (session 5)
 
 ### Three-finger pinch gesture (MISSION 1 — gesture-agent)
