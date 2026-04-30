@@ -1,5 +1,59 @@
 # Kontrol CHANGELOG v2
 
+## v1.6 — interactive settings panel with live threshold editing (session 7)
+
+### Architecture: frozen constants → mutable _SETTINGS dict
+- All 15 gesture thresholds moved from module-level frozen constants into
+  `_SETTINGS: dict[str, float | int]`, initialised from kontrol.conf on startup
+- `is_index_thumb()`, `is_middle_thumb()`, `is_ring_thumb()`, `is_pinky_thumb()`,
+  `is_bunch()`, `draw_skeleton()` updated to read from `_SETTINGS` (not frozen names)
+- All 34 threshold reads in gesture chain in `run()` use `_SETTINGS["key"]`
+- Settings take effect on the NEXT frame after clicking +/- — no restart needed
+
+### Settings panel UI (cv2-drawn, no native widgets)
+- `build_panel_rows()` — single layout registry (list of dicts) consumed by both
+  draw and mouse handler. 6 sections, 15 data rows, alternating row backgrounds.
+- `draw_settings_panel(frame, now)` — full overlay: 88% dark alpha, header bar,
+  scrollable row list, scrollbar, reset button, footer hint
+- Row columns: label (x=10), value (x=215, flashes cyan on change), [-] (x=295),
+  [+] (x=328), unit label (x=365)
+- Hover highlight: row background lightens when mouse is over it
+- Value flash: cyan for 0.5 s after any change; `__all__` key flashes everything
+
+### [S] button — top button row
+- Added to `draw_buttons()` left of [−]: amber `S` on dark bg, hover highlight,
+  active state (brighter) when panel is open
+- `_btn_settings` registered as module-level tuple; same pattern as `_btn_close`
+
+### Mouse callback extended
+- `_mouse_cb` checks `_settings_open[0]` first
+- Panel closed: original close/minimize/settings-open logic
+- Panel open: close-button → closes panel; reset-button (bottom) → `_reset_settings()`;
+  row +/- clicks via scroll-adjusted `adj_y`; mousemove → hover tracking;
+  MOUSEWHEEL → `_panel_scroll_y` clamped to content range
+- All mutable panel state uses list wrappers (`_settings_open`, `_panel_scroll_y`,
+  `_hover_row`, `_changed`) to avoid `global` declarations in callback
+
+### Save / reset
+- `_save_settings()` — writes all _SETTINGS keys back to `[gestures]` in kontrol.conf
+  immediately after every +/- click; prints `[SETTINGS] saved …`
+- `_reset_settings()` — reloads from `_DEFAULTS["gestures"]`, saves, flashes all values
+- STEP_SIZES, VALUE_CLAMPS, UNITS dicts define behaviour per key
+
+### S key toggle
+- `ord("s") / ord("S")` in main loop key handler toggles panel open/closed
+- Closing resets `_panel_scroll_y` to 0
+
+### Gesture detection during panel
+- Camera feed and gesture engine continue running while panel is open
+- Cursor movement, clicks, scroll all work — panel is display-only overlay
+
+### kontrol.conf
+- No new keys; existing `[gestures]` section written back by `_save_settings()`
+- Values round-tripped through `float(f"{v:.4f}")` to stay tidy
+
+---
+
 ## v1.5 — wrist rotation replaces peace sign → Alt+Tab (session 6)
 
 ### Removed: peace sign gesture
