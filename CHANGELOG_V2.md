@@ -1,5 +1,53 @@
 # Kontrol CHANGELOG v2
 
+## v1.7 — headless mode, gesture profiles, desktop swipe, systemd autostart (session 8)
+
+### Mission 1 — Headless mode
+- `--headless` CLI flag via argparse; `run.sh` already had `"$@"` passthrough
+- `HEADLESS = [bool]` module-level list; toggled at runtime with H key
+- `_running = [True]` + `_sig_handler` for SIGTERM/SIGINT → graceful exit
+- `notify(msg)` — sends `notify-send` desktop notification if `headless_notifications = true`
+- Main loop: `while _running[0] and cap.isOpened()` — exits cleanly on signal
+- H key: `cv2.destroyAllWindows()` + sets `HEADLESS[0] = True` (one-way; window re-created if toggled back)
+- All draw/imshow/waitKey calls guarded by `if not HEADLESS[0]`
+- `_DEFAULTS["system"]` gains `headless_notifications = true`; kontrol.conf updated
+
+### Mission 2 — Gesture profiles
+- `_PROFILES` dict: three built-in profiles — `default`, `precise`, `presentation`
+- `precise` — tighter thresholds: pinch 0.030, 3-finger 0.040, rotation 2.5, swipe 0.12
+- `presentation` — disables complex gestures with 9.99 thresholds; only cursor + pinch click
+- `_active_profile = ["default"]` tracks current profile name
+- `switch_profile(name)` — copies profile values into `_SETTINGS`, saves, flashes all values
+- `save_custom_profile()` — writes current `_SETTINGS` as `[profile_custom]` in kontrol.conf
+- Profile bar in settings panel (y=32–64): clickable buttons for each loaded profile
+- Keys 1/2/3 switch profiles with flash confirmation; Ctrl+S (panel open) saves custom
+- HUD shows `[PRF]` row; HUD background extended to 128px to fit
+
+### Mission 3 — Two-finger swipe → virtual desktop (new Priority 4)
+- `is_two_finger_extended(lm)` — index+middle extended, ring+pinky bent
+- New gesture state: `swipe_start_x`, `swipe_fired`, `last_swipe_t`
+- Priority chain renumbered: swipe=4, rotation=5, scroll=6, r-click=7, click/drag=8, cursor=9
+- Right swipe → KWin "Switch to Desktop to the Right" / Left swipe → "…to the Left"
+- `_KWIN_SHORTCUTS` + `_KWIN_KEYCODES` gain `desktop_right`/`desktop_left` entries
+  (fallback keycodes: Meta+Ctrl+Right/Left)
+- Config keys: `desktop_swipe_threshold = 0.08`, `desktop_swipe_cooldown = 0.6`
+- Settings panel: new "-- DESKTOP SWIPE (2-FINGER) --" section with 2 rows
+- Flash: "DESKTOP →" / "← DESKTOP" in cyan (0, 220, 220)
+- Hand-lost reset: `swipe_start_x = None`, `swipe_fired = False`
+
+### Mission 4 — Systemd user service (autostart)
+- `~/.config/systemd/user/kontrol.service` — starts after graphical session, restarts on failure
+- Runs `./run.sh --headless`; logs to `~/.local/share/kontrol.log`
+- `systemctl --user enable kontrol.service` → symlink in graphical-session.target.wants
+- `~/.config/logrotate/kontrol` — weekly rotation, 4 weeks, compressed
+- `~/.zshrc` gains: `kontrol`, `kontrolh`, `kontroloff`, `kontrolstatus`, `kontrollog` aliases
+
+### kontrol.conf
+- `[gestures]` gains: `desktop_swipe_threshold = 0.08`, `desktop_swipe_cooldown = 0.6`
+- `[system]` gains: `headless_notifications = true`
+
+---
+
 ## v1.6 — interactive settings panel with live threshold editing (session 7)
 
 ### Architecture: frozen constants → mutable _SETTINGS dict
