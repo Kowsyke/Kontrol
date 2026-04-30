@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Kontrol v1.4 — Hand gesture mouse control
+Kontrol v1.6 — Hand gesture mouse control
 MediaPipe Tasks API (0.10+) → ydotool (no pynput, Wayland-safe)
 
 Gesture priority order (strict — higher number never fires if lower active):
@@ -63,9 +63,9 @@ _DEFAULTS: dict[str, dict[str, str]] = {
         "bunch_hold_frames":      "12",
         "tile_move_threshold":    "0.050",
         "tile_cooldown":          "0.8",
-        "rotation_threshold":  "1.8",
-        "rotation_cooldown":   "0.6",
-        "rotation_min_frames": "8",
+        "rotation_threshold":     "1.8",
+        "rotation_cooldown":      "0.6",
+        "rotation_min_frames":    "8",
     },
     "detection": {
         "detection_confidence": "0.50",
@@ -96,9 +96,9 @@ def load_config() -> configparser.ConfigParser:
 
 _cfg = load_config()
 
-# ── CONSTANTS ─────────────────────────────────────────────────────────────────
-SCREEN_W   = _cfg.getint("screen", "width")
-SCREEN_H   = _cfg.getint("screen", "height")
+# ── CONSTANTS (non-gesture, frozen) ──────────────────────────────────────────
+SCREEN_W    = _cfg.getint("screen", "width")
+SCREEN_H    = _cfg.getint("screen", "height")
 SCREEN_DIAG = math.hypot(SCREEN_W, SCREEN_H)
 
 CAM_ID = _cfg.getint("camera", "id")
@@ -114,20 +114,6 @@ MIN_SMOOTH         = _cfg.getfloat("smoothing", "min_smooth")
 MAX_SMOOTH         = _cfg.getfloat("smoothing", "max_smooth")
 VELOCITY_SCALE     = _cfg.getfloat("smoothing", "velocity_scale")
 CURSOR_DEADZONE_PX = _cfg.getint("smoothing",   "cursor_deadzone_px")
-
-PINCH_THRESHOLD       = _cfg.getfloat("gestures", "pinch_threshold")
-PINCH_COOLDOWN        = _cfg.getfloat("gestures", "pinch_cooldown")
-THREE_FINGER_T        = _cfg.getfloat("gestures", "three_finger_threshold")
-THREE_FINGER_COOLDOWN = _cfg.getfloat("gestures", "three_finger_cooldown")
-SCROLL_DEADZONE       = _cfg.getfloat("gestures", "scroll_deadzone")
-SCROLL_SPEED          = _cfg.getfloat("gestures", "scroll_speed")
-SCROLL_VEL_ALPHA      = _cfg.getfloat("gestures", "scroll_vel_alpha")
-SCROLL_MAX_TICKS      = _cfg.getint("gestures",   "scroll_max_ticks")
-PALM_COOLDOWN         = _cfg.getfloat("gestures", "palm_cooldown")
-BUNCH_THRESHOLD       = _cfg.getfloat("gestures", "bunch_threshold")
-BUNCH_HOLD_FRAMES     = _cfg.getint("gestures",   "bunch_hold_frames")
-TILE_THRESHOLD        = _cfg.getfloat("gestures", "tile_move_threshold")
-TILE_COOLDOWN         = _cfg.getfloat("gestures", "tile_cooldown")
 
 DETECTION_CONF = _cfg.getfloat("detection", "detection_confidence")
 PRESENCE_CONF  = _cfg.getfloat("detection", "presence_confidence")
@@ -145,6 +131,87 @@ HandLandmarker           = mp.tasks.vision.HandLandmarker
 HandLandmarkerOptions    = mp.tasks.vision.HandLandmarkerOptions
 RunningMode              = mp.tasks.vision.RunningMode
 HandLandmarksConnections = mp.tasks.vision.HandLandmarksConnections
+
+# ── MUTABLE GESTURE SETTINGS ─────────────────────────────────────────────────
+_SETTINGS: dict[str, float | int] = {
+    "pinch_threshold":        _cfg.getfloat("gestures", "pinch_threshold"),
+    "pinch_cooldown":         _cfg.getfloat("gestures", "pinch_cooldown"),
+    "three_finger_threshold": _cfg.getfloat("gestures", "three_finger_threshold"),
+    "three_finger_cooldown":  _cfg.getfloat("gestures", "three_finger_cooldown"),
+    "scroll_deadzone":        _cfg.getfloat("gestures", "scroll_deadzone"),
+    "scroll_speed":           _cfg.getfloat("gestures", "scroll_speed"),
+    "scroll_vel_alpha":       _cfg.getfloat("gestures", "scroll_vel_alpha"),
+    "scroll_max_ticks":       _cfg.getint("gestures",   "scroll_max_ticks"),
+    "bunch_threshold":        _cfg.getfloat("gestures", "bunch_threshold"),
+    "bunch_hold_frames":      _cfg.getint("gestures",   "bunch_hold_frames"),
+    "palm_cooldown":          _cfg.getfloat("gestures", "palm_cooldown"),
+    "tile_move_threshold":    _cfg.getfloat("gestures", "tile_move_threshold"),
+    "tile_cooldown":          _cfg.getfloat("gestures", "tile_cooldown"),
+    "rotation_threshold":     _cfg.getfloat("gestures", "rotation_threshold"),
+    "rotation_cooldown":      _cfg.getfloat("gestures", "rotation_cooldown"),
+}
+
+STEP_SIZES: dict[str, float | int] = {
+    "pinch_threshold":        0.002,
+    "pinch_cooldown":         0.05,
+    "three_finger_threshold": 0.002,
+    "three_finger_cooldown":  0.1,
+    "scroll_deadzone":        0.001,
+    "scroll_speed":           0.5,
+    "scroll_vel_alpha":       0.02,
+    "scroll_max_ticks":       1,
+    "bunch_threshold":        0.005,
+    "bunch_hold_frames":      1,
+    "palm_cooldown":          0.1,
+    "tile_move_threshold":    0.005,
+    "tile_cooldown":          0.05,
+    "rotation_threshold":     0.1,
+    "rotation_cooldown":      0.05,
+}
+
+VALUE_CLAMPS: dict[str, tuple] = {
+    "pinch_threshold":        (0.010, 0.120),
+    "pinch_cooldown":         (0.10,  2.0),
+    "three_finger_threshold": (0.010, 0.120),
+    "three_finger_cooldown":  (0.5,   3.0),
+    "scroll_deadzone":        (0.001, 0.050),
+    "scroll_speed":           (1.0,   20.0),
+    "scroll_vel_alpha":       (0.05,  0.80),
+    "scroll_max_ticks":       (1,     20),
+    "bunch_threshold":        (0.020, 0.200),
+    "bunch_hold_frames":      (3,     40),
+    "palm_cooldown":          (0.5,   5.0),
+    "tile_move_threshold":    (0.010, 0.200),
+    "tile_cooldown":          (0.1,   3.0),
+    "rotation_threshold":     (0.3,   5.0),
+    "rotation_cooldown":      (0.1,   2.0),
+}
+
+UNITS: dict[str, str] = {
+    "pinch_threshold":        "norm",
+    "pinch_cooldown":         "sec",
+    "three_finger_threshold": "norm",
+    "three_finger_cooldown":  "sec",
+    "scroll_deadzone":        "norm",
+    "scroll_speed":           "x",
+    "scroll_vel_alpha":       "alpha",
+    "scroll_max_ticks":       "ticks",
+    "bunch_threshold":        "norm",
+    "bunch_hold_frames":      "frames",
+    "palm_cooldown":          "sec",
+    "tile_move_threshold":    "norm",
+    "tile_cooldown":          "sec",
+    "rotation_threshold":     "rad/s",
+    "rotation_cooldown":      "sec",
+}
+
+# ── PANEL STATE (list-wrapped for mutation inside callbacks) ──────────────────
+_settings_open  = [False]
+_panel_scroll_y = [0]
+_hover_row      = [-1]
+_changed        = ["", 0.0]   # [key, until]
+_mouse_xy       = [0, 0]      # [x, y]
+_PANEL_ROWS: list[dict] = []
 
 # ── VISUALIZATION CONSTANTS ───────────────────────────────────────────────────
 FINGER_COLORS = {
@@ -284,25 +351,113 @@ def _kontrol_is_active(win_name: str) -> bool:
     return _focus_cache[1]
 
 
+# ── SETTINGS HELPERS ──────────────────────────────────────────────────────────
+def _in_rect(x: int, y: int, rect: tuple | None) -> bool:
+    if rect is None:
+        return False
+    x1, y1, x2, y2 = rect
+    return x1 <= x <= x2 and y1 <= y <= y2
+
+
+def _save_settings() -> None:
+    cfg = configparser.ConfigParser()
+    cfg.read(CONF_PATH)
+    if not cfg.has_section("gestures"):
+        cfg.add_section("gestures")
+    for key, val in _SETTINGS.items():
+        cfg.set("gestures", key, str(val) if isinstance(val, int) else f"{val:.4f}")
+    with open(CONF_PATH, "w") as f:
+        cfg.write(f)
+    print(f"[SETTINGS] saved {CONF_PATH}")
+
+
+def _adjust_setting(key: str, direction: int) -> None:
+    step    = STEP_SIZES[key]
+    val     = _SETTINGS[key]
+    new_val = val + direction * step
+    lo, hi  = VALUE_CLAMPS[key]
+    if isinstance(val, int):
+        _SETTINGS[key] = int(max(lo, min(hi, round(new_val))))
+    else:
+        _SETTINGS[key] = round(float(max(lo, min(hi, new_val))), 4)
+    _save_settings()
+    _changed[0] = key
+    _changed[1] = time.time() + 0.5
+
+
+def _reset_settings() -> None:
+    for key in _SETTINGS:
+        raw = _DEFAULTS["gestures"][key]
+        _SETTINGS[key] = int(raw) if "." not in raw else float(raw)
+    _save_settings()
+    _changed[0] = "__all__"
+    _changed[1] = time.time() + 0.5
+    print("[SETTINGS] reset to defaults")
+
+
+def build_panel_rows() -> list[dict]:
+    rows: list[dict] = []
+    y = 40
+
+    def section(name: str) -> None:
+        nonlocal y
+        rows.append({"is_section": True, "label": name, "y": y})
+        y += 28
+
+    def row(key: str, label: str) -> None:
+        nonlocal y
+        rows.append({"is_section": False, "key": key, "label": label, "y": y})
+        y += 36
+
+    section("-- PINCH GESTURES --")
+    row("pinch_threshold",        "Pinch Threshold")
+    row("pinch_cooldown",         "Pinch Cooldown")
+
+    section("-- THREE FINGER --")
+    row("three_finger_threshold", "3-Finger Threshold")
+    row("three_finger_cooldown",  "3-Finger Cooldown")
+
+    section("-- SCROLL --")
+    row("scroll_deadzone",        "Scroll Deadzone")
+    row("scroll_speed",           "Scroll Speed")
+    row("scroll_vel_alpha",       "Scroll Velocity a")
+    row("scroll_max_ticks",       "Scroll Max Ticks")
+
+    section("-- TILE (PINKY+THUMB) --")
+    row("tile_move_threshold",    "Tile Move Threshold")
+    row("tile_cooldown",          "Tile Cooldown")
+
+    section("-- BUNCH / PALM CLOSE --")
+    row("bunch_threshold",        "Bunch Threshold")
+    row("bunch_hold_frames",      "Bunch Hold Frames")
+    row("palm_cooldown",          "Palm Cooldown")
+
+    section("-- WRIST ROTATION --")
+    row("rotation_threshold",     "Rotation Threshold")
+    row("rotation_cooldown",      "Rotation Cooldown")
+
+    return rows
+
+
 # ── LANDMARK HELPERS ──────────────────────────────────────────────────────────
 def pdist(lm, a: int, b: int) -> float:
     return math.hypot(lm[a].x - lm[b].x, lm[a].y - lm[b].y)
 
 
 def is_index_thumb(lm) -> bool:
-    return pdist(lm, 4, 8) < PINCH_THRESHOLD
+    return pdist(lm, 4, 8) < _SETTINGS["pinch_threshold"]
 
 
 def is_middle_thumb(lm) -> bool:
-    return pdist(lm, 4, 12) < PINCH_THRESHOLD
+    return pdist(lm, 4, 12) < _SETTINGS["pinch_threshold"]
 
 
 def is_ring_thumb(lm) -> bool:
-    return pdist(lm, 4, 16) < PINCH_THRESHOLD
+    return pdist(lm, 4, 16) < _SETTINGS["pinch_threshold"]
 
 
 def is_pinky_thumb(lm) -> bool:
-    return pdist(lm, 4, 20) < PINCH_THRESHOLD
+    return pdist(lm, 4, 20) < _SETTINGS["pinch_threshold"]
 
 
 def is_three_finger_pinch(lm, thresh: float) -> bool:
@@ -318,11 +473,12 @@ def knuckle_angle(lm) -> float:
 
 
 def is_bunch(lm) -> bool:
+    t = _SETTINGS["bunch_threshold"]
     return (
-        pdist(lm, 4, 8)  < BUNCH_THRESHOLD and
-        pdist(lm, 4, 12) < BUNCH_THRESHOLD and
-        pdist(lm, 4, 16) < BUNCH_THRESHOLD and
-        pdist(lm, 4, 20) < BUNCH_THRESHOLD
+        pdist(lm, 4, 8)  < t and
+        pdist(lm, 4, 12) < t and
+        pdist(lm, 4, 16) < t and
+        pdist(lm, 4, 20) < t
     )
 
 
@@ -361,7 +517,8 @@ def lm_radius(lm, i: int, base: int = 4, scale: int = 3) -> int:
 
 
 def draw_skeleton(frame, lm, fw: int, fh: int, active_pinches: dict) -> None:
-    # 1. Connections
+    pinch_t = _SETTINGS["pinch_threshold"]
+
     for a, b in HAND_CONNECTIONS:
         color = FINGER_COLORS[LANDMARK_FINGER[max(a, b)]]
         dim   = tuple(int(c * 0.55) for c in color)
@@ -370,7 +527,6 @@ def draw_skeleton(frame, lm, fw: int, fh: int, active_pinches: dict) -> None:
                  (int(lm[b].x * fw), int(lm[b].y * fh)),
                  dim, 1, cv2.LINE_AA)
 
-    # 2. All 21 dots
     for i in range(21):
         px = int(lm[i].x * fw); py = int(lm[i].y * fh)
         color = FINGER_COLORS[LANDMARK_FINGER[i]]
@@ -378,22 +534,19 @@ def draw_skeleton(frame, lm, fw: int, fh: int, active_pinches: dict) -> None:
         cv2.circle(frame, (px, py), r, color, -1, cv2.LINE_AA)
         cv2.circle(frame, (px, py), r, (220, 220, 220), 1, cv2.LINE_AA)
 
-    # 3. Fingertip highlight rings
     for tip in (4, 8, 12, 16, 20):
         px = int(lm[tip].x * fw); py = int(lm[tip].y * fh)
         color = FINGER_COLORS[LANDMARK_FINGER[tip]]
         r     = lm_radius(lm, tip, base=6, scale=4)
         cv2.circle(frame, (px, py), r + 4, color, 2, cv2.LINE_AA)
 
-    # 4. Wrist
     wx = int(lm[0].x * fw); wy = int(lm[0].y * fh)
     cv2.circle(frame, (wx, wy), 8, (255, 255, 255), -1, cv2.LINE_AA)
     cv2.circle(frame, (wx, wy), 8, (180, 180, 180), 2, cv2.LINE_AA)
 
-    # 5. Dynamic pinch lines
     def draw_pinch_line(a: int, b: int, active_color: tuple) -> None:
         dist = pdist(lm, a, b)
-        t    = max(0.0, min(1.0, 1.0 - dist / (PINCH_THRESHOLD * 2)))
+        t    = max(0.0, min(1.0, 1.0 - dist / (pinch_t * 2)))
         col  = tuple(int(80 * (1 - t) + active_color[c] * t) for c in range(3))
         cv2.line(frame,
                  (int(lm[a].x * fw), int(lm[a].y * fh)),
@@ -404,7 +557,6 @@ def draw_skeleton(frame, lm, fw: int, fh: int, active_pinches: dict) -> None:
     draw_pinch_line(4, 12, ( 50, 180,  50))
     draw_pinch_line(4, 20, ( 50, 200, 200))
 
-    # 6. Three-finger triangle
     if active_pinches.get("three_finger"):
         pts = np.array([
             [int(lm[4].x * fw),  int(lm[4].y * fh)],
@@ -413,7 +565,6 @@ def draw_skeleton(frame, lm, fw: int, fh: int, active_pinches: dict) -> None:
         ], dtype=np.int32)
         cv2.polylines(frame, [pts], True, (220, 50, 220), 2, cv2.LINE_AA)
 
-    # 7. Landmark numbers (toggle 'n')
     if SHOW_LM_NUMBERS:
         for i in range(21):
             cv2.putText(frame, str(i),
@@ -457,9 +608,10 @@ def draw_hud(frame, gesture: str, fps: float,
              flash_msg: str = "",
              flash_until: float = 0.0,
              flash_color: tuple = (0, 255, 220)) -> None:
-    h, w = frame.shape[:2]
-    now  = time.time()
-    font = cv2.FONT_HERSHEY_SIMPLEX
+    h, w  = frame.shape[:2]
+    now   = time.time()
+    font  = cv2.FONT_HERSHEY_SIMPLEX
+    bhf   = _SETTINGS["bunch_hold_frames"]
 
     if not hand_detected:
         border_col = (0, 0, 200)
@@ -496,9 +648,9 @@ def draw_hud(frame, gesture: str, fps: float,
 
     if palm_count > 0:
         BAR_W  = 10
-        filled = min(palm_count * BAR_W // BUNCH_HOLD_FRAMES, BAR_W)
+        filled = min(palm_count * BAR_W // max(1, bhf), BAR_W)
         bar    = "█" * filled + "░" * (BAR_W - filled)
-        cv2.putText(frame, f"[PALM] {bar} {palm_count}/{BUNCH_HOLD_FRAMES}",
+        cv2.putText(frame, f"[PALM] {bar} {palm_count}/{bhf}",
                     (x0, y0 + 5 * dy), font, 0.40, (0, 180, 255), 1)
 
     if flash_msg and now < flash_until:
@@ -508,26 +660,161 @@ def draw_hud(frame, gesture: str, fps: float,
         cv2.putText(frame, flash_msg, (tx, ty), font, 1.2, flash_color, 2)
 
 
+# ── SETTINGS PANEL DRAW ───────────────────────────────────────────────────────
+def draw_settings_panel(frame, now: float) -> None:
+    fw = frame.shape[1]
+    fh = frame.shape[0]
+    sy = _panel_scroll_y[0]
+
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (0, 0), (fw, fh), (10, 10, 20), -1)
+    cv2.addWeighted(overlay, 0.88, frame, 0.12, 0, frame)
+
+    cv2.rectangle(frame, (0, 0), (fw, 32), (20, 20, 40), -1)
+    cv2.putText(frame, "KONTROL  GESTURE SETTINGS",
+                (10, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 255), 1)
+
+    mx, my = _mouse_xy[0], _mouse_xy[1]
+
+    for i, row in enumerate(_PANEL_ROWS):
+        ry_abs = row["y"] - sy
+
+        if ry_abs + 36 < 32 or ry_abs > fh:
+            continue
+
+        if row["is_section"]:
+            cv2.rectangle(frame, (0, ry_abs), (fw, ry_abs + 26), (15, 15, 55), -1)
+            cv2.putText(frame, row["label"],
+                        (10, ry_abs + 18),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.40, (100, 180, 255), 1)
+            continue
+
+        row_bg = (50, 50, 60) if i == _hover_row[0] else \
+                 (35, 35, 35) if i % 2 else (25, 25, 25)
+        cv2.rectangle(frame, (0, ry_abs), (fw, ry_abs + 36), row_bg, -1)
+
+        cv2.putText(frame, row["label"],
+                    (10, ry_abs + 23),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, (200, 200, 200), 1)
+
+        key     = row["key"]
+        val     = _SETTINGS[key]
+        val_str = str(val) if isinstance(val, int) else f"{val:.3f}"
+        all_fl  = (_changed[0] == "__all__" and now < _changed[1])
+        key_fl  = (_changed[0] == key       and now < _changed[1])
+        vc      = (50, 220, 220) if (all_fl or key_fl) else (255, 255, 255)
+        cv2.putText(frame, val_str, (215, ry_abs + 23),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.48, vc, 1)
+
+        mbx1, mby1, mbx2, mby2 = 295, ry_abs + 7, 323, ry_abs + 29
+        m_hov = mbx1 <= mx <= mbx2 and mby1 <= my <= mby2
+        cv2.rectangle(frame, (mbx1, mby1), (mbx2, mby2),
+                      (80, 80, 80) if m_hov else (45, 45, 45), -1)
+        cv2.rectangle(frame, (mbx1, mby1), (mbx2, mby2), (140, 140, 140), 1)
+        cv2.putText(frame, "-", (mbx1 + 8, mby1 + 16),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1)
+
+        pbx1, pby1, pbx2, pby2 = 328, ry_abs + 7, 356, ry_abs + 29
+        p_hov = pbx1 <= mx <= pbx2 and pby1 <= my <= pby2
+        cv2.rectangle(frame, (pbx1, pby1), (pbx2, pby2),
+                      (80, 80, 80) if p_hov else (45, 45, 45), -1)
+        cv2.rectangle(frame, (pbx1, pby1), (pbx2, pby2), (140, 140, 140), 1)
+        cv2.putText(frame, "+", (pbx1 + 7, pby1 + 16),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1)
+
+        unit = UNITS.get(key, "")
+        cv2.putText(frame, unit, (365, ry_abs + 23),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, (120, 120, 120), 1)
+
+        cv2.line(frame, (0, ry_abs + 35), (fw, ry_abs + 35), (50, 50, 50), 1)
+
+    total_h   = sum(26 if r["is_section"] else 36 for r in _PANEL_ROWS) + 40
+    visible_h = fh - 32
+    if total_h > visible_h:
+        bar_h = max(20, int(visible_h * visible_h / total_h))
+        travel = max(1, total_h - visible_h)
+        bar_y  = 32 + int(sy * (visible_h - bar_h) / travel)
+        cv2.rectangle(frame, (fw - 6, bar_y), (fw - 2, bar_y + bar_h),
+                      (100, 100, 100), -1)
+
+    reset_y = fh - 34
+    cv2.rectangle(frame, (10, reset_y), (140, reset_y + 26), (40, 20, 20), -1)
+    cv2.rectangle(frame, (10, reset_y), (140, reset_y + 26), (120, 60, 60), 1)
+    cv2.putText(frame, "RESET DEFAULTS", (14, reset_y + 17),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.38, (200, 100, 100), 1)
+
+    cv2.putText(frame, "Changes save instantly to kontrol.conf",
+                (150, fh - 18),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.32, (80, 80, 80), 1)
+
+
 # ── BUTTONS ───────────────────────────────────────────────────────────────────
-_quit_flag             = [False]
-_btn_close: tuple | None = None
-_btn_min:   tuple | None = None
+_quit_flag              = [False]
+_btn_close:  tuple | None = None
+_btn_min:    tuple | None = None
+_btn_settings: tuple | None = None
 
 
 def _mouse_cb(event, x, y, flags, param) -> None:
-    if event != cv2.EVENT_LBUTTONDOWN:
+    _mouse_xy[0] = x
+    _mouse_xy[1] = y
+
+    if not _settings_open[0]:
+        if event == cv2.EVENT_LBUTTONDOWN:
+            if _in_rect(x, y, _btn_close):
+                _quit_flag[0] = True
+            elif _in_rect(x, y, _btn_min):
+                subprocess.Popen(
+                    ["wmctrl", "-r", ":ACTIVE:", "-b", "add,hidden"],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                )
+            elif _in_rect(x, y, _btn_settings):
+                _settings_open[0] = True
         return
-    if _btn_close and _btn_close[0] <= x <= _btn_close[2] and \
-                      _btn_close[1] <= y <= _btn_close[3]:
-        _quit_flag[0] = True
-    elif _btn_min and _btn_min[0] <= x <= _btn_min[2] and \
-                      _btn_min[1] <= y <= _btn_min[3]:
-        subprocess.Popen(["wmctrl", "-r", ":ACTIVE:", "-b", "add,hidden"],
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    # ── Panel is open ─────────────────────────────────────────────────────────
+    if event == cv2.EVENT_LBUTTONDOWN:
+        if _in_rect(x, y, _btn_close):
+            _settings_open[0]  = False
+            _panel_scroll_y[0] = 0
+            return
+
+        # Reset button (y range 446–472 for fh=480)
+        if _in_rect(x, y, (10, 446, 140, 472)):
+            _reset_settings()
+            return
+
+        adj_y = y + _panel_scroll_y[0]
+        for row in _PANEL_ROWS:
+            if row["is_section"]:
+                continue
+            ry = row["y"]
+            if ry <= adj_y <= ry + 36:
+                if _in_rect(x, adj_y, (295, ry + 7, 323, ry + 29)):
+                    _adjust_setting(row["key"], -1)
+                elif _in_rect(x, adj_y, (328, ry + 7, 356, ry + 29)):
+                    _adjust_setting(row["key"], +1)
+                break
+
+    elif event == cv2.EVENT_MOUSEMOVE:
+        adj_y = y + _panel_scroll_y[0]
+        _hover_row[0] = -1
+        for i, row in enumerate(_PANEL_ROWS):
+            if row["is_section"]:
+                continue
+            if row["y"] <= adj_y <= row["y"] + 36:
+                _hover_row[0] = i
+                break
+
+    elif event == cv2.EVENT_MOUSEWHEEL:
+        total_h   = sum(26 if r["is_section"] else 36 for r in _PANEL_ROWS) + 40
+        max_scroll = max(0, total_h - 448)
+        delta = -36 if flags > 0 else 36
+        _panel_scroll_y[0] = max(0, min(max_scroll, _panel_scroll_y[0] + delta))
 
 
 def draw_buttons(frame) -> None:
-    global _btn_close, _btn_min
+    global _btn_close, _btn_min, _btn_settings
     h, w        = frame.shape[:2]
     pad, bw, bh = 5, 28, 20
 
@@ -544,6 +831,16 @@ def draw_buttons(frame) -> None:
     cv2.rectangle(frame, (mx1, my1), (mx2, my2), (140, 140, 140), 1)
     cv2.putText(frame, "-", (mx1 + 9, my2 - 4),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.55, (220, 220, 220), 1)
+
+    sx1 = mx1 - pad - bw; sy1 = pad; sx2 = mx1 - pad; sy2 = pad + bh
+    _btn_settings = (sx1, sy1, sx2, sy2)
+    s_active = _settings_open[0]
+    s_hov    = sx1 <= _mouse_xy[0] <= sx2 and sy1 <= _mouse_xy[1] <= sy2
+    s_bg     = (100, 80, 20) if s_active else (80, 60, 10) if s_hov else (50, 40, 10)
+    cv2.rectangle(frame, (sx1, sy1), (sx2, sy2), s_bg, -1)
+    cv2.rectangle(frame, (sx1, sy1), (sx2, sy2), (140, 140, 140), 1)
+    cv2.putText(frame, "S", (sx1 + 8, sy2 - 4),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (220, 200, 100), 1)
 
 
 # ── STARTUP SOUND ─────────────────────────────────────────────────────────────
@@ -623,7 +920,7 @@ def run_cursor_pipeline(
 
 # ── MAIN LOOP ─────────────────────────────────────────────────────────────────
 def run() -> None:
-    global KWIN_DBUS, SHOW_LM_NUMBERS, SHOW_LM_INFO
+    global KWIN_DBUS, SHOW_LM_NUMBERS, SHOW_LM_INFO, _PANEL_ROWS
 
     if not MODEL_PATH.exists():
         raise FileNotFoundError(
@@ -633,7 +930,8 @@ def run() -> None:
             "hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task"
         )
 
-    KWIN_DBUS = kwin_dbus_available()
+    KWIN_DBUS   = kwin_dbus_available()
+    _PANEL_ROWS = build_panel_rows()
     print(f"[KWIN] D-Bus {'available ✓' if KWIN_DBUS else 'unavailable, using keycodes'}")
 
     opts = HandLandmarkerOptions(
@@ -663,7 +961,7 @@ def run() -> None:
 
     play_startup_sound()
 
-    win_name = "Kontrol v1.4"
+    win_name = "Kontrol v1.6"
     cv2.namedWindow(win_name)
     cv2.setMouseCallback(win_name, _mouse_cb)
 
@@ -699,9 +997,7 @@ def run() -> None:
     # ── GESTURE STATE — wrist rotation (priority 4) ──────────────────────────
     rot_angle_history: deque = deque(maxlen=12)
     rot_last_fired_t:  float = 0.0
-    ROT_THRESHOLD:     float = _cfg.getfloat("gestures", "rotation_threshold")
-    ROT_COOLDOWN:      float = _cfg.getfloat("gestures", "rotation_cooldown")
-    ROT_MIN_FRAMES:    int   = _cfg.getint("gestures",   "rotation_min_frames")
+    ROT_MIN_FRAMES:    int   = _cfg.getint("gestures", "rotation_min_frames")
 
     # ── GESTURE STATE — middle+thumb scroll (priority 5) ─────────────────────
     mt_held:      bool         = False
@@ -733,11 +1029,11 @@ def run() -> None:
     pd_3f: float = 1.0
 
     print(
-        f"Kontrol v1.4  {SCREEN_W}x{SCREEN_H}"
+        f"Kontrol v1.6  {SCREEN_W}x{SCREEN_H}"
         f"  cam=/dev/video{CAM_ID}"
-        f"  pinch={PINCH_THRESHOLD}  3f={THREE_FINGER_T}"
-        f"  bunch={BUNCH_THRESHOLD}/{BUNCH_HOLD_FRAMES}fr"
-        f"  [n]=LM nums  [i]=LM info  [q]=quit"
+        f"  pinch={_SETTINGS['pinch_threshold']}  3f={_SETTINGS['three_finger_threshold']}"
+        f"  bunch={_SETTINGS['bunch_threshold']}/{_SETTINGS['bunch_hold_frames']}fr"
+        f"  [n]=LM  [i]=info  [s]=settings  [q]=quit"
     )
 
     _last_ts_ms: int = 0
@@ -796,12 +1092,12 @@ def run() -> None:
                         mouse_up()
                         drag_active = False
 
-                    active_gesture = f"PALM {palm_frames}/{BUNCH_HOLD_FRAMES}"
+                    active_gesture = f"PALM {palm_frames}/{_SETTINGS['bunch_hold_frames']}"
 
                 else:
                     if palm_was_closed:
-                        if (palm_frames >= BUNCH_HOLD_FRAMES
-                                and (now - last_palm_t) > PALM_COOLDOWN):
+                        if (palm_frames >= _SETTINGS["bunch_hold_frames"]
+                                and (now - last_palm_t) > _SETTINGS["palm_cooldown"]):
                             subprocess.run(
                                 ["qdbus", "org.kde.kglobalaccel", "/component/kwin",
                                  "org.kde.kglobalaccel.Component.invokeShortcut",
@@ -835,8 +1131,9 @@ def run() -> None:
                             dy_total = lm[0].y - tile_start_y
                             adx, ady = abs(dx_total), abs(dy_total)
 
-                            if (adx > TILE_THRESHOLD or ady > TILE_THRESHOLD) \
-                                    and (now - last_tile_t) > TILE_COOLDOWN:
+                            if (adx > _SETTINGS["tile_move_threshold"]
+                                    or ady > _SETTINGS["tile_move_threshold"]) \
+                                    and (now - last_tile_t) > _SETTINGS["tile_cooldown"]:
                                 direction = (
                                     ("right" if dx_total > 0 else "left") if adx > ady
                                     else ("down" if dy_total > 0 else "up")
@@ -856,14 +1153,14 @@ def run() -> None:
 
                         # ════════════════════════════════════════════════════
                         # PRIORITY 3 — THREE-FINGER PINCH → OVERVIEW
-                        # Must be checked BEFORE middle+thumb (superset)
                         # ════════════════════════════════════════════════════
-                        if is_three_finger_pinch(lm, THREE_FINGER_T):
+                        if is_three_finger_pinch(lm, _SETTINGS["three_finger_threshold"]):
                             three_finger_active = True
                             was_gesturing       = True
 
                             if (not three_finger_held
-                                    and (now - last_three_finger_t) > THREE_FINGER_COOLDOWN):
+                                    and (now - last_three_finger_t)
+                                        > _SETTINGS["three_finger_cooldown"]):
                                 fire_kwin("task_view")
                                 last_three_finger_t = now
                                 flash_msg   = "TASK VIEW"
@@ -894,11 +1191,11 @@ def run() -> None:
 
                                     ang_vel = raw_delta / rot_dt
 
-                                    if abs(ang_vel) > ROT_THRESHOLD:
+                                    if abs(ang_vel) > _SETTINGS["rotation_threshold"]:
                                         rotation_direction = "CW" if ang_vel < 0 else "CCW"
 
                             if rotation_direction is not None:
-                                if (now - rot_last_fired_t) > ROT_COOLDOWN:
+                                if (now - rot_last_fired_t) > _SETTINGS["rotation_cooldown"]:
                                     if rotation_direction == "CW":
                                         subprocess.run(
                                             ["ydotool", "key",
@@ -943,16 +1240,23 @@ def run() -> None:
 
                                     dy_norm      = lm[0].y - scroll_ref_y
                                     scroll_ref_y = lm[0].y
-                                    scroll_vel   = (scroll_vel * (1.0 - SCROLL_VEL_ALPHA)
-                                                    + dy_norm * SCROLL_VEL_ALPHA)
+                                    scroll_vel   = (
+                                        scroll_vel * (1.0 - _SETTINGS["scroll_vel_alpha"])
+                                        + dy_norm  * _SETTINGS["scroll_vel_alpha"]
+                                    )
 
-                                    if abs(scroll_vel) > SCROLL_DEADZONE:
-                                        ticks   = max(1, min(SCROLL_MAX_TICKS,
-                                                             int(abs(scroll_vel) * SCROLL_SPEED)))
+                                    if abs(scroll_vel) > _SETTINGS["scroll_deadzone"]:
+                                        ticks = max(1, min(
+                                            _SETTINGS["scroll_max_ticks"],
+                                            int(abs(scroll_vel) * _SETTINGS["scroll_speed"])
+                                        ))
                                         wheel_y = -ticks if scroll_vel < 0 else ticks
                                         ydocall("mousemove", "--wheel",
                                                 "-x", "0", "-y", str(wheel_y))
-                                        active_gesture = f"SCROLL {'UP' if scroll_vel < 0 else 'DOWN'} x{ticks}"
+                                        active_gesture = (
+                                            f"SCROLL {'UP' if scroll_vel < 0 else 'DOWN'}"
+                                            f" x{ticks}"
+                                        )
                                     else:
                                         active_gesture = f"SCROLL HOLD  M={pd_mt:.3f}"
 
@@ -966,8 +1270,8 @@ def run() -> None:
                                     # PRIORITY 6 — RING+THUMB → RIGHT CLICK
                                     # ════════════════════════════════════════
                                     if is_ring_thumb(lm):
-                                        if not rt_held \
-                                                and (now - last_rclick_t) > PINCH_COOLDOWN:
+                                        if not rt_held and \
+                                                (now - last_rclick_t) > _SETTINGS["pinch_cooldown"]:
                                             if not _kontrol_is_active(win_name):
                                                 right_click()
                                             last_rclick_t  = now
@@ -987,9 +1291,10 @@ def run() -> None:
                                                 it_start_t = now
 
                                             held_t = now - it_start_t
-                                            if (held_t > PINCH_COOLDOWN
+                                            if (held_t > _SETTINGS["pinch_cooldown"]
                                                     and not drag_active
-                                                    and (now - last_drag_end_t) > PINCH_COOLDOWN):
+                                                    and (now - last_drag_end_t)
+                                                        > _SETTINGS["pinch_cooldown"]):
                                                 mouse_down()
                                                 drag_active = True
 
@@ -1015,8 +1320,9 @@ def run() -> None:
                                                     mouse_up()
                                                     drag_active     = False
                                                     last_drag_end_t = now
-                                                elif ((now - it_start_t) < PINCH_COOLDOWN
-                                                      and (now - last_drag_end_t) > PINCH_COOLDOWN):
+                                                elif ((now - it_start_t) < _SETTINGS["pinch_cooldown"]
+                                                      and (now - last_drag_end_t)
+                                                          > _SETTINGS["pinch_cooldown"]):
                                                     mouse_down()
                                                     mouse_up()
                                                     active_gesture = "L-CLICK"
@@ -1071,25 +1377,29 @@ def run() -> None:
                 was_gesturing     = True
                 active_gesture    = "NO HAND"
 
-            draw_hud(
-                frame,
-                gesture             = active_gesture,
-                fps                 = fps,
-                pd_it               = pd_it,
-                pd_mt               = pd_mt,
-                pd_rt               = pd_rt,
-                pd_pt               = pd_pt,
-                pd_3f               = pd_3f,
-                palm_count          = palm_frames,
-                drag_active         = drag_active,
-                tile_held           = pt_held,
-                three_finger_active = three_finger_active,
-                hand_detected       = bool(result.hand_landmarks),
-                palm_closing        = palm_frames > 0,
-                flash_msg           = flash_msg,
-                flash_until         = flash_until,
-                flash_color         = flash_color,
-            )
+            if _settings_open[0]:
+                draw_settings_panel(frame, now)
+            else:
+                draw_hud(
+                    frame,
+                    gesture             = active_gesture,
+                    fps                 = fps,
+                    pd_it               = pd_it,
+                    pd_mt               = pd_mt,
+                    pd_rt               = pd_rt,
+                    pd_pt               = pd_pt,
+                    pd_3f               = pd_3f,
+                    palm_count          = palm_frames,
+                    drag_active         = drag_active,
+                    tile_held           = pt_held,
+                    three_finger_active = three_finger_active,
+                    hand_detected       = bool(result.hand_landmarks),
+                    palm_closing        = palm_frames > 0,
+                    flash_msg           = flash_msg,
+                    flash_until         = flash_until,
+                    flash_color         = flash_color,
+                )
+
             draw_buttons(frame)
             cv2.imshow(win_name, frame)
 
@@ -1103,6 +1413,11 @@ def run() -> None:
             elif key == ord("i"):
                 SHOW_LM_INFO = not SHOW_LM_INFO
                 print(f"[HUD] LM info overlay {'ON' if SHOW_LM_INFO else 'OFF'}")
+            elif key in (ord("s"), ord("S")):
+                _settings_open[0] = not _settings_open[0]
+                if not _settings_open[0]:
+                    _panel_scroll_y[0] = 0
+                print(f"[SETTINGS] panel {'open' if _settings_open[0] else 'closed'}")
 
             elapsed   = time.perf_counter() - frame_start
             remaining = FRAME_INTERVAL - elapsed
