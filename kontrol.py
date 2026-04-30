@@ -18,9 +18,11 @@ Config: kontrol.conf (INI format, same directory)
 Launch: cd /home/K/Storage/Projects/Kontrol && ./run.sh
 """
 
+import argparse
 import configparser
 import math
 import os
+import signal
 import struct
 import subprocess
 import tempfile
@@ -32,6 +34,23 @@ from pathlib import Path
 import cv2
 import mediapipe as mp
 import numpy as np
+
+# ── CLI & SIGNALS ─────────────────────────────────────────────────────────────
+_ap = argparse.ArgumentParser(description="Kontrol — hand gesture mouse control")
+_ap.add_argument("--headless", action="store_true", help="Run without display window")
+_args, _ = _ap.parse_known_args()
+HEADLESS  = [_args.headless]
+
+_running = [True]
+
+
+def _sig_handler(signum, _frame) -> None:
+    _running[0] = False
+    print(f"\n[kontrol] Signal {signum} — shutting down")
+
+
+signal.signal(signal.SIGTERM, _sig_handler)
+signal.signal(signal.SIGINT,  _sig_handler)
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
 CONF_PATH  = Path(__file__).parent / "kontrol.conf"
@@ -63,16 +82,21 @@ _DEFAULTS: dict[str, dict[str, str]] = {
         "bunch_hold_frames":      "12",
         "tile_move_threshold":    "0.050",
         "tile_cooldown":          "0.8",
-        "rotation_threshold":     "1.8",
-        "rotation_cooldown":      "0.6",
-        "rotation_min_frames":    "8",
+        "rotation_threshold":       "1.8",
+        "rotation_cooldown":        "0.6",
+        "rotation_min_frames":      "8",
+        "desktop_swipe_threshold":  "0.08",
+        "desktop_swipe_cooldown":   "0.6",
     },
     "detection": {
         "detection_confidence": "0.50",
         "presence_confidence":  "0.50",
         "tracking_confidence":  "0.50",
     },
-    "system": {"ydotool_socket": "/run/user/1000/.ydotool_socket"},
+    "system": {
+        "ydotool_socket":         "/run/user/1000/.ydotool_socket",
+        "headless_notifications": "true",
+    },
     "camera_tuning": {
         "auto_exposure": "1", "exposure_time_absolute": "300",
         "gain": "100", "brightness": "160", "contrast": "130",
@@ -147,8 +171,10 @@ _SETTINGS: dict[str, float | int] = {
     "palm_cooldown":          _cfg.getfloat("gestures", "palm_cooldown"),
     "tile_move_threshold":    _cfg.getfloat("gestures", "tile_move_threshold"),
     "tile_cooldown":          _cfg.getfloat("gestures", "tile_cooldown"),
-    "rotation_threshold":     _cfg.getfloat("gestures", "rotation_threshold"),
-    "rotation_cooldown":      _cfg.getfloat("gestures", "rotation_cooldown"),
+    "rotation_threshold":      _cfg.getfloat("gestures", "rotation_threshold"),
+    "rotation_cooldown":       _cfg.getfloat("gestures", "rotation_cooldown"),
+    "desktop_swipe_threshold": _cfg.getfloat("gestures", "desktop_swipe_threshold"),
+    "desktop_swipe_cooldown":  _cfg.getfloat("gestures", "desktop_swipe_cooldown"),
 }
 
 STEP_SIZES: dict[str, float | int] = {
@@ -165,8 +191,10 @@ STEP_SIZES: dict[str, float | int] = {
     "palm_cooldown":          0.1,
     "tile_move_threshold":    0.005,
     "tile_cooldown":          0.05,
-    "rotation_threshold":     0.1,
-    "rotation_cooldown":      0.05,
+    "rotation_threshold":      0.1,
+    "rotation_cooldown":       0.05,
+    "desktop_swipe_threshold": 0.01,
+    "desktop_swipe_cooldown":  0.05,
 }
 
 VALUE_CLAMPS: dict[str, tuple] = {
@@ -183,8 +211,10 @@ VALUE_CLAMPS: dict[str, tuple] = {
     "palm_cooldown":          (0.5,   5.0),
     "tile_move_threshold":    (0.010, 0.200),
     "tile_cooldown":          (0.1,   3.0),
-    "rotation_threshold":     (0.3,   5.0),
-    "rotation_cooldown":      (0.1,   2.0),
+    "rotation_threshold":      (0.3,   5.0),
+    "rotation_cooldown":       (0.1,   2.0),
+    "desktop_swipe_threshold": (0.02,  0.30),
+    "desktop_swipe_cooldown":  (0.1,   3.0),
 }
 
 UNITS: dict[str, str] = {
@@ -201,8 +231,10 @@ UNITS: dict[str, str] = {
     "palm_cooldown":          "sec",
     "tile_move_threshold":    "norm",
     "tile_cooldown":          "sec",
-    "rotation_threshold":     "rad/s",
-    "rotation_cooldown":      "sec",
+    "rotation_threshold":      "rad/s",
+    "rotation_cooldown":       "sec",
+    "desktop_swipe_threshold": "norm",
+    "desktop_swipe_cooldown":  "sec",
 }
 
 # ── PANEL STATE (list-wrapped for mutation inside callbacks) ──────────────────
@@ -212,6 +244,73 @@ _hover_row      = [-1]
 _changed        = ["", 0.0]   # [key, until]
 _mouse_xy       = [0, 0]      # [x, y]
 _PANEL_ROWS: list[dict] = []
+
+# ── GESTURE PROFILES ──────────────────────────────────────────────────────────
+_active_profile = ["default"]
+
+_PROFILES: dict[str, dict[str, float | int]] = {
+    "default": {
+        "pinch_threshold": 0.048, "pinch_cooldown": 0.35,
+        "three_finger_threshold": 0.058, "three_finger_cooldown": 1.5,
+        "scroll_deadzone": 0.008, "scroll_speed": 6.0,
+        "scroll_vel_alpha": 0.30, "scroll_max_ticks": 8,
+        "bunch_threshold": 0.10, "bunch_hold_frames": 12,
+        "palm_cooldown": 2.0, "tile_move_threshold": 0.050,
+        "tile_cooldown": 0.8, "rotation_threshold": 1.8,
+        "rotation_cooldown": 0.6,
+        "desktop_swipe_threshold": 0.08, "desktop_swipe_cooldown": 0.6,
+    },
+    "precise": {
+        "pinch_threshold": 0.030, "pinch_cooldown": 0.25,
+        "three_finger_threshold": 0.040, "three_finger_cooldown": 1.5,
+        "scroll_deadzone": 0.005, "scroll_speed": 5.0,
+        "scroll_vel_alpha": 0.25, "scroll_max_ticks": 6,
+        "bunch_threshold": 0.08, "bunch_hold_frames": 15,
+        "palm_cooldown": 2.0, "tile_move_threshold": 0.070,
+        "tile_cooldown": 1.0, "rotation_threshold": 2.5,
+        "rotation_cooldown": 0.8,
+        "desktop_swipe_threshold": 0.12, "desktop_swipe_cooldown": 0.8,
+    },
+    "presentation": {
+        "pinch_threshold": 0.048, "pinch_cooldown": 0.35,
+        "three_finger_threshold": 9.99, "three_finger_cooldown": 1.5,
+        "scroll_deadzone": 0.008, "scroll_speed": 6.0,
+        "scroll_vel_alpha": 0.30, "scroll_max_ticks": 8,
+        "bunch_threshold": 0.10, "bunch_hold_frames": 20,
+        "palm_cooldown": 3.0, "tile_move_threshold": 9.99,
+        "tile_cooldown": 0.8, "rotation_threshold": 9.99,
+        "rotation_cooldown": 0.6,
+        "desktop_swipe_threshold": 9.99, "desktop_swipe_cooldown": 0.6,
+    },
+}
+
+
+def switch_profile(name: str) -> None:
+    if name not in _PROFILES:
+        return
+    _active_profile[0] = name
+    for key, val in _PROFILES[name].items():
+        if key in _SETTINGS:
+            _SETTINGS[key] = val
+    _save_settings()
+    _changed[0] = "__all__"
+    _changed[1] = time.time() + 0.5
+    print(f"[PROFILE] switched to '{name}'")
+
+
+def save_custom_profile() -> None:
+    _PROFILES["custom"] = dict(_SETTINGS)
+    _active_profile[0]  = "custom"
+    cfg = configparser.ConfigParser()
+    cfg.read(CONF_PATH)
+    section = "profile_custom"
+    if not cfg.has_section(section):
+        cfg.add_section(section)
+    for key, val in _SETTINGS.items():
+        cfg.set(section, key, str(val) if isinstance(val, int) else f"{val:.4f}")
+    with open(CONF_PATH, "w") as f:
+        cfg.write(f)
+    print("[PROFILE] saved 'custom' to kontrol.conf")
 
 # ── VISUALIZATION CONSTANTS ───────────────────────────────────────────────────
 FINGER_COLORS = {
@@ -246,22 +345,26 @@ SHOW_LM_INFO:    bool = False
 
 # ── KWIN D-BUS ────────────────────────────────────────────────────────────────
 _KWIN_SHORTCUTS: dict[str, str] = {
-    "right":        "Window Quick Tile Right",
-    "left":         "Window Quick Tile Left",
-    "up":           "Window Quick Tile Top",
-    "down":         "Window Quick Tile Bottom",
-    "maximize":     "Window Maximize",
-    "minimize":     "Window Minimize",
-    "task_view":    "Overview",
-    "show_desktop": "Show Desktop",
+    "right":         "Window Quick Tile Right",
+    "left":          "Window Quick Tile Left",
+    "up":            "Window Quick Tile Top",
+    "down":          "Window Quick Tile Bottom",
+    "maximize":      "Window Maximize",
+    "minimize":      "Window Minimize",
+    "task_view":     "Overview",
+    "show_desktop":  "Show Desktop",
+    "desktop_right": "Switch to Desktop to the Right",
+    "desktop_left":  "Switch to Desktop to the Left",
 }
 
 _KWIN_KEYCODES: dict[str, tuple[str, ...]] = {
-    "right":     ("125:1", "106:1", "106:0", "125:0"),
-    "left":      ("125:1", "105:1", "105:0", "125:0"),
-    "up":        ("125:1", "103:1", "103:0", "125:0"),
-    "down":      ("125:1", "108:1", "108:0", "125:0"),
-    "task_view": ("125:1", "104:1", "104:0", "125:0"),
+    "right":         ("125:1", "106:1", "106:0", "125:0"),
+    "left":          ("125:1", "105:1", "105:0", "125:0"),
+    "up":            ("125:1", "103:1", "103:0", "125:0"),
+    "down":          ("125:1", "108:1", "108:0", "125:0"),
+    "task_view":     ("125:1", "104:1", "104:0", "125:0"),
+    "desktop_right": ("125:1", "29:1", "106:1", "106:0", "29:0", "125:0"),
+    "desktop_left":  ("125:1", "29:1", "105:1", "105:0", "29:0", "125:0"),
 }
 
 KWIN_DBUS: bool = False
@@ -351,6 +454,14 @@ def _kontrol_is_active(win_name: str) -> bool:
     return _focus_cache[1]
 
 
+def notify(msg: str) -> None:
+    if _cfg.getboolean("system", "headless_notifications", fallback=True):
+        subprocess.Popen(
+            ["notify-send", "-a", "Kontrol", "-t", "3000", msg],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+
+
 # ── SETTINGS HELPERS ──────────────────────────────────────────────────────────
 def _in_rect(x: int, y: int, rect: tuple | None) -> bool:
     if rect is None:
@@ -397,7 +508,7 @@ def _reset_settings() -> None:
 
 def build_panel_rows() -> list[dict]:
     rows: list[dict] = []
-    y = 40
+    y = 72
 
     def section(name: str) -> None:
         nonlocal y
@@ -435,6 +546,10 @@ def build_panel_rows() -> list[dict]:
     section("-- WRIST ROTATION --")
     row("rotation_threshold",     "Rotation Threshold")
     row("rotation_cooldown",      "Rotation Cooldown")
+
+    section("-- DESKTOP SWIPE (2-FINGER) --")
+    row("desktop_swipe_threshold", "Swipe Threshold")
+    row("desktop_swipe_cooldown",  "Swipe Cooldown")
 
     return rows
 
@@ -479,6 +594,15 @@ def is_bunch(lm) -> bool:
         pdist(lm, 4, 12) < t and
         pdist(lm, 4, 16) < t and
         pdist(lm, 4, 20) < t
+    )
+
+
+def is_two_finger_extended(lm) -> bool:
+    return (
+        lm[8].y  < lm[6].y  and   # index extended
+        lm[12].y < lm[10].y and   # middle extended
+        lm[16].y > lm[13].y and   # ring bent
+        lm[20].y > lm[17].y       # pinky bent
     )
 
 
@@ -629,7 +753,7 @@ def draw_hud(frame, gesture: str, fps: float,
     cv2.rectangle(frame, (0, 0), (w - 1, h - 1), border_col, 3)
 
     overlay = frame.copy()
-    cv2.rectangle(overlay, (0, 0), (290, 108), (10, 10, 10), -1)
+    cv2.rectangle(overlay, (0, 0), (290, 128), (10, 10, 10), -1)
     cv2.addWeighted(overlay, 0.65, frame, 0.35, 0, frame)
 
     lc = (0, 200, 200)
@@ -645,6 +769,7 @@ def draw_hud(frame, gesture: str, fps: float,
     hud_line(2, "[GESTURE]", gesture)
     hud_line(3, "[PINCH]  ", f"I={pd_it:.3f} M={pd_mt:.3f} 3F={pd_3f:.3f}")
     hud_line(4, "         ", f"P={pd_pt:.3f} R={pd_rt:.3f}")
+    hud_line(5, "[PRF]    ", _active_profile[0])
 
     if palm_count > 0:
         BAR_W  = 10
@@ -674,12 +799,29 @@ def draw_settings_panel(frame, now: float) -> None:
     cv2.putText(frame, "KONTROL  GESTURE SETTINGS",
                 (10, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 255), 1)
 
+    # ── Profile bar (y=32–64) ─────────────────────────────────────────────────
+    cv2.rectangle(frame, (0, 32), (fw, 64), (15, 15, 35), -1)
+    _pnames = [p for p in ("default", "precise", "presentation", "custom")
+               if p in _PROFILES]
+    _pbtn_w = 90
+    for _pi, _pname in enumerate(_pnames):
+        _bx1 = 5 + _pi * (_pbtn_w + 5)
+        _bx2 = _bx1 + _pbtn_w
+        _is_act = _active_profile[0] == _pname
+        _bg  = (60, 90, 60) if _is_act else (30, 30, 50)
+        _bdr = (80, 180, 80) if _is_act else (70, 70, 100)
+        cv2.rectangle(frame, (_bx1, 36), (_bx2, 62), _bg, -1)
+        cv2.rectangle(frame, (_bx1, 36), (_bx2, 62), _bdr, 1)
+        _tc = (100, 255, 100) if _is_act else (160, 160, 160)
+        cv2.putText(frame, _pname[:12], (_bx1 + 4, 55),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.30, _tc, 1)
+
     mx, my = _mouse_xy[0], _mouse_xy[1]
 
     for i, row in enumerate(_PANEL_ROWS):
         ry_abs = row["y"] - sy
 
-        if ry_abs + 36 < 32 or ry_abs > fh:
+        if ry_abs + 36 < 64 or ry_abs > fh:
             continue
 
         if row["is_section"]:
@@ -728,12 +870,12 @@ def draw_settings_panel(frame, now: float) -> None:
 
         cv2.line(frame, (0, ry_abs + 35), (fw, ry_abs + 35), (50, 50, 50), 1)
 
-    total_h   = sum(26 if r["is_section"] else 36 for r in _PANEL_ROWS) + 40
-    visible_h = fh - 32
+    total_h   = sum(26 if r["is_section"] else 36 for r in _PANEL_ROWS) + 72
+    visible_h = fh - 64
     if total_h > visible_h:
         bar_h = max(20, int(visible_h * visible_h / total_h))
         travel = max(1, total_h - visible_h)
-        bar_y  = 32 + int(sy * (visible_h - bar_h) / travel)
+        bar_y  = 64 + int(sy * (visible_h - bar_h) / travel)
         cv2.rectangle(frame, (fw - 6, bar_y), (fw - 2, bar_y + bar_h),
                       (100, 100, 100), -1)
 
@@ -784,6 +926,17 @@ def _mouse_cb(event, x, y, flags, param) -> None:
             _reset_settings()
             return
 
+        # Profile bar (y=36–62, fixed — does not scroll)
+        if 36 <= y <= 62:
+            _pnames = [p for p in ("default", "precise", "presentation", "custom")
+                       if p in _PROFILES]
+            for _pi, _pname in enumerate(_pnames):
+                _bx1 = 5 + _pi * 95
+                if _bx1 <= x <= _bx1 + 90:
+                    switch_profile(_pname)
+                    break
+            return
+
         adj_y = y + _panel_scroll_y[0]
         for row in _PANEL_ROWS:
             if row["is_section"]:
@@ -807,8 +960,8 @@ def _mouse_cb(event, x, y, flags, param) -> None:
                 break
 
     elif event == cv2.EVENT_MOUSEWHEEL:
-        total_h   = sum(26 if r["is_section"] else 36 for r in _PANEL_ROWS) + 40
-        max_scroll = max(0, total_h - 448)
+        total_h   = sum(26 if r["is_section"] else 36 for r in _PANEL_ROWS) + 72
+        max_scroll = max(0, total_h - 376)
         delta = -36 if flags > 0 else 36
         _panel_scroll_y[0] = max(0, min(max_scroll, _panel_scroll_y[0] + delta))
 
@@ -961,9 +1114,13 @@ def run() -> None:
 
     play_startup_sound()
 
-    win_name = "Kontrol v1.6"
-    cv2.namedWindow(win_name)
-    cv2.setMouseCallback(win_name, _mouse_cb)
+    win_name = "Kontrol v1.7"
+    if not HEADLESS[0]:
+        cv2.namedWindow(win_name)
+        cv2.setMouseCallback(win_name, _mouse_cb)
+        notify("Kontrol started")
+    else:
+        notify("Kontrol started (headless)")
 
     # ── CURSOR STATE ──────────────────────────────────────────────────────────
     raw_x_s: float | None = None
@@ -994,7 +1151,12 @@ def run() -> None:
     three_finger_held:   bool  = False
     last_three_finger_t: float = 0.0
 
-    # ── GESTURE STATE — wrist rotation (priority 4) ──────────────────────────
+    # ── GESTURE STATE — two-finger swipe (priority 4) ────────────────────────
+    swipe_start_x: float | None = None
+    swipe_fired:   bool         = False
+    last_swipe_t:  float        = 0.0
+
+    # ── GESTURE STATE — wrist rotation (priority 5) ──────────────────────────
     rot_angle_history: deque = deque(maxlen=12)
     rot_last_fired_t:  float = 0.0
     ROT_MIN_FRAMES:    int   = _cfg.getint("gestures", "rotation_min_frames")
@@ -1029,17 +1191,18 @@ def run() -> None:
     pd_3f: float = 1.0
 
     print(
-        f"Kontrol v1.6  {SCREEN_W}x{SCREEN_H}"
+        f"Kontrol v1.7  {SCREEN_W}x{SCREEN_H}"
         f"  cam=/dev/video{CAM_ID}"
         f"  pinch={_SETTINGS['pinch_threshold']}  3f={_SETTINGS['three_finger_threshold']}"
         f"  bunch={_SETTINGS['bunch_threshold']}/{_SETTINGS['bunch_hold_frames']}fr"
-        f"  [n]=LM  [i]=info  [s]=settings  [q]=quit"
+        f"  headless={'yes' if HEADLESS[0] else 'no'}"
+        f"  [n]=LM  [i]=info  [s]=settings  [h]=headless  [1/2/3]=profile  [q]=quit"
     )
 
     _last_ts_ms: int = 0
 
     with HandLandmarker.create_from_options(opts) as detector:
-        while cap.isOpened():
+        while _running[0] and cap.isOpened():
             frame_start = time.perf_counter()
 
             ok, frame = cap.read()
@@ -1173,132 +1336,196 @@ def run() -> None:
                             three_finger_held = False
 
                             # ════════════════════════════════════════════════
-                            # PRIORITY 4 — WRIST ROTATION → ALT+TAB
+                            # PRIORITY 4 — TWO-FINGER SWIPE → DESKTOP
                             # ════════════════════════════════════════════════
-                            rotation_direction = None
-
-                            if len(rot_angle_history) >= ROT_MIN_FRAMES:
-                                t_old, a_old = rot_angle_history[0]
-                                t_new, a_new = rot_angle_history[-1]
-                                rot_dt = t_new - t_old
-
-                                if rot_dt > 0.05:
-                                    raw_delta = a_new - a_old
-                                    if raw_delta > math.pi:
-                                        raw_delta -= 2 * math.pi
-                                    elif raw_delta < -math.pi:
-                                        raw_delta += 2 * math.pi
-
-                                    ang_vel = raw_delta / rot_dt
-
-                                    if abs(ang_vel) > _SETTINGS["rotation_threshold"]:
-                                        rotation_direction = "CW" if ang_vel < 0 else "CCW"
-
-                            if rotation_direction is not None:
-                                if (now - rot_last_fired_t) > _SETTINGS["rotation_cooldown"]:
-                                    if rotation_direction == "CW":
-                                        subprocess.run(
-                                            ["ydotool", "key",
-                                             "56:1", "15:1", "15:0", "56:0"],
-                                            env=os.environ,
-                                            stdout=subprocess.DEVNULL,
-                                            stderr=subprocess.DEVNULL,
-                                        )
-                                        flash_msg      = "ALT+TAB →"
-                                        flash_color    = (200, 200, 50)
-                                        flash_until    = now + 0.6
-                                        active_gesture = "ROT CW → ALT+TAB"
-                                    else:
-                                        subprocess.run(
-                                            ["ydotool", "key",
-                                             "42:1", "56:1", "15:1", "15:0", "42:0", "56:0"],
-                                            env=os.environ,
-                                            stdout=subprocess.DEVNULL,
-                                            stderr=subprocess.DEVNULL,
-                                        )
-                                        flash_msg      = "← ALT+TAB"
-                                        flash_color    = (200, 200, 50)
-                                        flash_until    = now + 0.6
-                                        active_gesture = "ROT CCW ← ALT+TAB"
-
-                                    rot_last_fired_t = now
-                                    rot_angle_history.clear()
-
+                            if is_two_finger_extended(lm):
                                 was_gesturing = True
+                                if swipe_start_x is None:
+                                    swipe_start_x = lm[8].x
+                                    swipe_fired   = False
+
+                                if not swipe_fired:
+                                    dx_swipe = lm[8].x - swipe_start_x
+                                    if (abs(dx_swipe) > _SETTINGS["desktop_swipe_threshold"]
+                                            and (now - last_swipe_t)
+                                                > _SETTINGS["desktop_swipe_cooldown"]):
+                                        if dx_swipe > 0:
+                                            fire_kwin("desktop_right")
+                                            flash_msg = "DESKTOP →"
+                                        else:
+                                            fire_kwin("desktop_left")
+                                            flash_msg = "← DESKTOP"
+                                        flash_color    = (0, 220, 220)
+                                        flash_until    = now + 0.6
+                                        swipe_fired    = True
+                                        last_swipe_t   = now
+                                        active_gesture = flash_msg
+                                else:
+                                    active_gesture = "SWIPE HOLD"
 
                             else:
+                                swipe_start_x = None
+                                swipe_fired   = False
+
                                 # ════════════════════════════════════════════
-                                # PRIORITY 5 — MIDDLE+THUMB → SCROLL
+                                # PRIORITY 5 — WRIST ROTATION → ALT+TAB
                                 # ════════════════════════════════════════════
-                                if is_middle_thumb(lm):
+                                rotation_direction = None
+
+                                if len(rot_angle_history) >= ROT_MIN_FRAMES:
+                                    t_old, a_old = rot_angle_history[0]
+                                    t_new, a_new = rot_angle_history[-1]
+                                    rot_dt = t_new - t_old
+
+                                    if rot_dt > 0.05:
+                                        raw_delta = a_new - a_old
+                                        if raw_delta > math.pi:
+                                            raw_delta -= 2 * math.pi
+                                        elif raw_delta < -math.pi:
+                                            raw_delta += 2 * math.pi
+
+                                        ang_vel = raw_delta / rot_dt
+
+                                        if abs(ang_vel) > _SETTINGS["rotation_threshold"]:
+                                            rotation_direction = "CW" if ang_vel < 0 else "CCW"
+
+                                if rotation_direction is not None:
+                                    if (now - rot_last_fired_t) > _SETTINGS["rotation_cooldown"]:
+                                        if rotation_direction == "CW":
+                                            subprocess.run(
+                                                ["ydotool", "key",
+                                                 "56:1", "15:1", "15:0", "56:0"],
+                                                env=os.environ,
+                                                stdout=subprocess.DEVNULL,
+                                                stderr=subprocess.DEVNULL,
+                                            )
+                                            flash_msg      = "ALT+TAB →"
+                                            flash_color    = (200, 200, 50)
+                                            flash_until    = now + 0.6
+                                            active_gesture = "ROT CW → ALT+TAB"
+                                        else:
+                                            subprocess.run(
+                                                ["ydotool", "key",
+                                                 "42:1", "56:1", "15:1", "15:0", "42:0", "56:0"],
+                                                env=os.environ,
+                                                stdout=subprocess.DEVNULL,
+                                                stderr=subprocess.DEVNULL,
+                                            )
+                                            flash_msg      = "← ALT+TAB"
+                                            flash_color    = (200, 200, 50)
+                                            flash_until    = now + 0.6
+                                            active_gesture = "ROT CCW ← ALT+TAB"
+
+                                        rot_last_fired_t = now
+                                        rot_angle_history.clear()
+
                                     was_gesturing = True
 
-                                    if not mt_held:
-                                        mt_held      = True
-                                        scroll_ref_y = lm[0].y
-                                        scroll_vel   = 0.0
-
-                                    dy_norm      = lm[0].y - scroll_ref_y
-                                    scroll_ref_y = lm[0].y
-                                    scroll_vel   = (
-                                        scroll_vel * (1.0 - _SETTINGS["scroll_vel_alpha"])
-                                        + dy_norm  * _SETTINGS["scroll_vel_alpha"]
-                                    )
-
-                                    if abs(scroll_vel) > _SETTINGS["scroll_deadzone"]:
-                                        ticks = max(1, min(
-                                            _SETTINGS["scroll_max_ticks"],
-                                            int(abs(scroll_vel) * _SETTINGS["scroll_speed"])
-                                        ))
-                                        wheel_y = -ticks if scroll_vel < 0 else ticks
-                                        ydocall("mousemove", "--wheel",
-                                                "-x", "0", "-y", str(wheel_y))
-                                        active_gesture = (
-                                            f"SCROLL {'UP' if scroll_vel < 0 else 'DOWN'}"
-                                            f" x{ticks}"
-                                        )
-                                    else:
-                                        active_gesture = f"SCROLL HOLD  M={pd_mt:.3f}"
-
                                 else:
-                                    if mt_held:
-                                        mt_held      = False
-                                        scroll_ref_y = None
-                                        scroll_vel   = 0.0
-
                                     # ════════════════════════════════════════
-                                    # PRIORITY 6 — RING+THUMB → RIGHT CLICK
+                                    # PRIORITY 6 — MIDDLE+THUMB → SCROLL
                                     # ════════════════════════════════════════
-                                    if is_ring_thumb(lm):
-                                        if not rt_held and \
-                                                (now - last_rclick_t) > _SETTINGS["pinch_cooldown"]:
-                                            if not _kontrol_is_active(win_name):
-                                                right_click()
-                                            last_rclick_t  = now
-                                            active_gesture = f"R-CLICK  R={pd_rt:.3f}"
-                                        rt_held       = True
+                                    if is_middle_thumb(lm):
                                         was_gesturing = True
 
+                                        if not mt_held:
+                                            mt_held      = True
+                                            scroll_ref_y = lm[0].y
+                                            scroll_vel   = 0.0
+
+                                        dy_norm      = lm[0].y - scroll_ref_y
+                                        scroll_ref_y = lm[0].y
+                                        scroll_vel   = (
+                                            scroll_vel * (1.0 - _SETTINGS["scroll_vel_alpha"])
+                                            + dy_norm  * _SETTINGS["scroll_vel_alpha"]
+                                        )
+
+                                        if abs(scroll_vel) > _SETTINGS["scroll_deadzone"]:
+                                            ticks = max(1, min(
+                                                _SETTINGS["scroll_max_ticks"],
+                                                int(abs(scroll_vel) * _SETTINGS["scroll_speed"])
+                                            ))
+                                            wheel_y = -ticks if scroll_vel < 0 else ticks
+                                            ydocall("mousemove", "--wheel",
+                                                    "-x", "0", "-y", str(wheel_y))
+                                            active_gesture = (
+                                                f"SCROLL {'UP' if scroll_vel < 0 else 'DOWN'}"
+                                                f" x{ticks}"
+                                            )
+                                        else:
+                                            active_gesture = f"SCROLL HOLD  M={pd_mt:.3f}"
+
                                     else:
-                                        rt_held = False
+                                        if mt_held:
+                                            mt_held      = False
+                                            scroll_ref_y = None
+                                            scroll_vel   = 0.0
 
                                         # ════════════════════════════════════
-                                        # PRIORITY 7 — INDEX+THUMB → CLICK/DRAG
+                                        # PRIORITY 7 — RING+THUMB → RIGHT CLICK
                                         # ════════════════════════════════════
-                                        if is_index_thumb(lm):
-                                            if not it_held:
-                                                it_held    = True
-                                                it_start_t = now
+                                        if is_ring_thumb(lm):
+                                            if not rt_held and \
+                                                    (now - last_rclick_t) > _SETTINGS["pinch_cooldown"]:
+                                                if not _kontrol_is_active(win_name):
+                                                    right_click()
+                                                last_rclick_t  = now
+                                                active_gesture = f"R-CLICK  R={pd_rt:.3f}"
+                                            rt_held       = True
+                                            was_gesturing = True
 
-                                            held_t = now - it_start_t
-                                            if (held_t > _SETTINGS["pinch_cooldown"]
-                                                    and not drag_active
-                                                    and (now - last_drag_end_t)
-                                                        > _SETTINGS["pinch_cooldown"]):
-                                                mouse_down()
-                                                drag_active = True
+                                        else:
+                                            rt_held = False
 
-                                            if drag_active:
+                                            # ════════════════════════════════
+                                            # PRIORITY 8 — INDEX+THUMB → CLICK/DRAG
+                                            # ════════════════════════════════
+                                            if is_index_thumb(lm):
+                                                if not it_held:
+                                                    it_held    = True
+                                                    it_start_t = now
+
+                                                held_t = now - it_start_t
+                                                if (held_t > _SETTINGS["pinch_cooldown"]
+                                                        and not drag_active
+                                                        and (now - last_drag_end_t)
+                                                            > _SETTINGS["pinch_cooldown"]):
+                                                    mouse_down()
+                                                    drag_active = True
+
+                                                if drag_active:
+                                                    reentry = first_frame or was_gesturing
+                                                    (raw_x_s, raw_y_s, cx, cy,
+                                                     prev_tx, prev_ty,
+                                                     prev_sent_x, prev_sent_y) = \
+                                                        run_cursor_pipeline(
+                                                            lm, raw_x_s, raw_y_s,
+                                                            cx, cy, prev_tx, prev_ty,
+                                                            prev_sent_x, prev_sent_y,
+                                                            reentry=reentry)
+                                                    was_gesturing  = False
+                                                    active_gesture = f"DRAG  I={pd_it:.3f}"
+                                                else:
+                                                    was_gesturing  = True
+                                                    active_gesture = f"PINCH  I={pd_it:.3f}"
+
+                                            else:
+                                                if it_held:
+                                                    if drag_active:
+                                                        mouse_up()
+                                                        drag_active     = False
+                                                        last_drag_end_t = now
+                                                    elif ((now - it_start_t) < _SETTINGS["pinch_cooldown"]
+                                                          and (now - last_drag_end_t)
+                                                              > _SETTINGS["pinch_cooldown"]):
+                                                        mouse_down()
+                                                        mouse_up()
+                                                        active_gesture = "L-CLICK"
+                                                    it_held = False
+
+                                                # ════════════════════════════
+                                                # PRIORITY 9 — CURSOR
+                                                # ════════════════════════════
                                                 reentry = first_frame or was_gesturing
                                                 (raw_x_s, raw_y_s, cx, cy,
                                                  prev_tx, prev_ty,
@@ -1308,40 +1535,8 @@ def run() -> None:
                                                         cx, cy, prev_tx, prev_ty,
                                                         prev_sent_x, prev_sent_y,
                                                         reentry=reentry)
+                                                active_gesture = "CURSOR"
                                                 was_gesturing  = False
-                                                active_gesture = f"DRAG  I={pd_it:.3f}"
-                                            else:
-                                                was_gesturing  = True
-                                                active_gesture = f"PINCH  I={pd_it:.3f}"
-
-                                        else:
-                                            if it_held:
-                                                if drag_active:
-                                                    mouse_up()
-                                                    drag_active     = False
-                                                    last_drag_end_t = now
-                                                elif ((now - it_start_t) < _SETTINGS["pinch_cooldown"]
-                                                      and (now - last_drag_end_t)
-                                                          > _SETTINGS["pinch_cooldown"]):
-                                                    mouse_down()
-                                                    mouse_up()
-                                                    active_gesture = "L-CLICK"
-                                                it_held = False
-
-                                            # ════════════════════════════════
-                                            # PRIORITY 8 — CURSOR
-                                            # ════════════════════════════════
-                                            reentry = first_frame or was_gesturing
-                                            (raw_x_s, raw_y_s, cx, cy,
-                                             prev_tx, prev_ty,
-                                             prev_sent_x, prev_sent_y) = \
-                                                run_cursor_pipeline(
-                                                    lm, raw_x_s, raw_y_s,
-                                                    cx, cy, prev_tx, prev_ty,
-                                                    prev_sent_x, prev_sent_y,
-                                                    reentry=reentry)
-                                            active_gesture = "CURSOR"
-                                            was_gesturing  = False
 
                 draw_skeleton(frame, lm, fw_px, fh_px, {
                     "three_finger": three_finger_active,
@@ -1374,50 +1569,82 @@ def run() -> None:
                 palm_was_closed   = False
                 rot_angle_history.clear()
                 tile_fired        = False
+                swipe_start_x     = None
+                swipe_fired       = False
                 was_gesturing     = True
                 active_gesture    = "NO HAND"
 
-            if _settings_open[0]:
-                draw_settings_panel(frame, now)
+            if not HEADLESS[0]:
+                if _settings_open[0]:
+                    draw_settings_panel(frame, now)
+                else:
+                    draw_hud(
+                        frame,
+                        gesture             = active_gesture,
+                        fps                 = fps,
+                        pd_it               = pd_it,
+                        pd_mt               = pd_mt,
+                        pd_rt               = pd_rt,
+                        pd_pt               = pd_pt,
+                        pd_3f               = pd_3f,
+                        palm_count          = palm_frames,
+                        drag_active         = drag_active,
+                        tile_held           = pt_held,
+                        three_finger_active = three_finger_active,
+                        hand_detected       = bool(result.hand_landmarks),
+                        palm_closing        = palm_frames > 0,
+                        flash_msg           = flash_msg,
+                        flash_until         = flash_until,
+                        flash_color         = flash_color,
+                    )
+
+                draw_buttons(frame)
+                cv2.imshow(win_name, frame)
+
+                key = cv2.waitKey(1) & 0xFF
+                ctrl = key & 0x1F if key != 0xFF else 0xFF
+                if _quit_flag[0] or key == ord("q"):
+                    print("Quit.")
+                    break
+                elif key == ord("n"):
+                    SHOW_LM_NUMBERS = not SHOW_LM_NUMBERS
+                    print(f"[HUD] landmark numbers {'ON' if SHOW_LM_NUMBERS else 'OFF'}")
+                elif key == ord("i"):
+                    SHOW_LM_INFO = not SHOW_LM_INFO
+                    print(f"[HUD] LM info overlay {'ON' if SHOW_LM_INFO else 'OFF'}")
+                elif key in (ord("s"), ord("S")):
+                    _settings_open[0] = not _settings_open[0]
+                    if not _settings_open[0]:
+                        _panel_scroll_y[0] = 0
+                    print(f"[SETTINGS] panel {'open' if _settings_open[0] else 'closed'}")
+                elif key in (ord("h"), ord("H")):
+                    HEADLESS[0] = True
+                    cv2.destroyAllWindows()
+                    notify("Kontrol running headless")
+                    print("[HEADLESS] window closed — running headless")
+                elif key == ord("1"):
+                    switch_profile("default")
+                    flash_msg   = "PROFILE: default"
+                    flash_color = (100, 220, 100)
+                    flash_until = now + 1.0
+                elif key == ord("2"):
+                    switch_profile("precise")
+                    flash_msg   = "PROFILE: precise"
+                    flash_color = (100, 220, 100)
+                    flash_until = now + 1.0
+                elif key == ord("3"):
+                    switch_profile("presentation")
+                    flash_msg   = "PROFILE: presentation"
+                    flash_color = (100, 220, 100)
+                    flash_until = now + 1.0
+                elif ctrl == 19 and _settings_open[0]:  # Ctrl+S
+                    save_custom_profile()
+                    flash_msg   = "PROFILE: custom saved"
+                    flash_color = (100, 220, 100)
+                    flash_until = now + 1.0
             else:
-                draw_hud(
-                    frame,
-                    gesture             = active_gesture,
-                    fps                 = fps,
-                    pd_it               = pd_it,
-                    pd_mt               = pd_mt,
-                    pd_rt               = pd_rt,
-                    pd_pt               = pd_pt,
-                    pd_3f               = pd_3f,
-                    palm_count          = palm_frames,
-                    drag_active         = drag_active,
-                    tile_held           = pt_held,
-                    three_finger_active = three_finger_active,
-                    hand_detected       = bool(result.hand_landmarks),
-                    palm_closing        = palm_frames > 0,
-                    flash_msg           = flash_msg,
-                    flash_until         = flash_until,
-                    flash_color         = flash_color,
-                )
-
-            draw_buttons(frame)
-            cv2.imshow(win_name, frame)
-
-            key = cv2.waitKey(1) & 0xFF
-            if _quit_flag[0] or key == ord("q"):
-                print("Quit.")
-                break
-            elif key == ord("n"):
-                SHOW_LM_NUMBERS = not SHOW_LM_NUMBERS
-                print(f"[HUD] landmark numbers {'ON' if SHOW_LM_NUMBERS else 'OFF'}")
-            elif key == ord("i"):
-                SHOW_LM_INFO = not SHOW_LM_INFO
-                print(f"[HUD] LM info overlay {'ON' if SHOW_LM_INFO else 'OFF'}")
-            elif key in (ord("s"), ord("S")):
-                _settings_open[0] = not _settings_open[0]
-                if not _settings_open[0]:
-                    _panel_scroll_y[0] = 0
-                print(f"[SETTINGS] panel {'open' if _settings_open[0] else 'closed'}")
+                if not _running[0]:
+                    break
 
             elapsed   = time.perf_counter() - frame_start
             remaining = FRAME_INTERVAL - elapsed
@@ -1425,7 +1652,9 @@ def run() -> None:
                 time.sleep(remaining)
 
     cap.release()
-    cv2.destroyAllWindows()
+    if not HEADLESS[0]:
+        cv2.destroyAllWindows()
+    notify("Kontrol stopped")
 
 
 if __name__ == "__main__":
