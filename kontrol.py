@@ -26,6 +26,7 @@ import signal
 import struct
 import subprocess
 import tempfile
+import threading
 import time
 import wave
 from collections import deque
@@ -34,6 +35,12 @@ from pathlib import Path
 import cv2
 import mediapipe as mp
 import numpy as np
+
+try:
+    from flask import Flask, jsonify, request as freq
+    _FLASK_OK = True
+except ImportError:
+    _FLASK_OK = False
 
 # ── CLI & SIGNALS ─────────────────────────────────────────────────────────────
 _ap = argparse.ArgumentParser(description="Kontrol — hand gesture mouse control")
@@ -87,6 +94,8 @@ _DEFAULTS: dict[str, dict[str, str]] = {
         "rotation_min_frames":      "8",
         "desktop_swipe_threshold":  "0.08",
         "desktop_swipe_cooldown":   "0.6",
+        "zoom_threshold":           "0.06",
+        "zoom_cooldown":            "0.4",
     },
     "detection": {
         "detection_confidence": "0.50",
@@ -96,6 +105,9 @@ _DEFAULTS: dict[str, dict[str, str]] = {
     "system": {
         "ydotool_socket":         "/run/user/1000/.ydotool_socket",
         "headless_notifications": "true",
+        "api_enabled":            "true",
+        "api_host":               "127.0.0.1",
+        "api_port":               "5555",
     },
     "camera_tuning": {
         "auto_exposure": "1", "exposure_time_absolute": "300",
@@ -175,6 +187,8 @@ _SETTINGS: dict[str, float | int] = {
     "rotation_cooldown":       _cfg.getfloat("gestures", "rotation_cooldown"),
     "desktop_swipe_threshold": _cfg.getfloat("gestures", "desktop_swipe_threshold"),
     "desktop_swipe_cooldown":  _cfg.getfloat("gestures", "desktop_swipe_cooldown"),
+    "zoom_threshold":          _cfg.getfloat("gestures", "zoom_threshold"),
+    "zoom_cooldown":           _cfg.getfloat("gestures", "zoom_cooldown"),
 }
 
 STEP_SIZES: dict[str, float | int] = {
@@ -195,6 +209,8 @@ STEP_SIZES: dict[str, float | int] = {
     "rotation_cooldown":       0.05,
     "desktop_swipe_threshold": 0.01,
     "desktop_swipe_cooldown":  0.05,
+    "zoom_threshold":          0.005,
+    "zoom_cooldown":           0.05,
 }
 
 VALUE_CLAMPS: dict[str, tuple] = {
@@ -215,6 +231,8 @@ VALUE_CLAMPS: dict[str, tuple] = {
     "rotation_cooldown":       (0.1,   2.0),
     "desktop_swipe_threshold": (0.02,  0.30),
     "desktop_swipe_cooldown":  (0.1,   3.0),
+    "zoom_threshold":          (0.01,  0.20),
+    "zoom_cooldown":           (0.1,   2.0),
 }
 
 UNITS: dict[str, str] = {
@@ -235,6 +253,8 @@ UNITS: dict[str, str] = {
     "rotation_cooldown":       "sec",
     "desktop_swipe_threshold": "norm",
     "desktop_swipe_cooldown":  "sec",
+    "zoom_threshold":          "norm",
+    "zoom_cooldown":           "sec",
 }
 
 # ── PANEL STATE (list-wrapped for mutation inside callbacks) ──────────────────
@@ -259,6 +279,7 @@ _PROFILES: dict[str, dict[str, float | int]] = {
         "tile_cooldown": 0.8, "rotation_threshold": 1.8,
         "rotation_cooldown": 0.6,
         "desktop_swipe_threshold": 0.08, "desktop_swipe_cooldown": 0.6,
+        "zoom_threshold": 0.06, "zoom_cooldown": 0.4,
     },
     "precise": {
         "pinch_threshold": 0.030, "pinch_cooldown": 0.25,
@@ -270,6 +291,7 @@ _PROFILES: dict[str, dict[str, float | int]] = {
         "tile_cooldown": 1.0, "rotation_threshold": 2.5,
         "rotation_cooldown": 0.8,
         "desktop_swipe_threshold": 0.12, "desktop_swipe_cooldown": 0.8,
+        "zoom_threshold": 0.04, "zoom_cooldown": 0.5,
     },
     "presentation": {
         "pinch_threshold": 0.048, "pinch_cooldown": 0.35,
@@ -281,6 +303,7 @@ _PROFILES: dict[str, dict[str, float | int]] = {
         "tile_cooldown": 0.8, "rotation_threshold": 9.99,
         "rotation_cooldown": 0.6,
         "desktop_swipe_threshold": 9.99, "desktop_swipe_cooldown": 0.6,
+        "zoom_threshold": 9.99, "zoom_cooldown": 0.4,
     },
 }
 
@@ -311,6 +334,227 @@ def save_custom_profile() -> None:
     with open(CONF_PATH, "w") as f:
         cfg.write(f)
     print("[PROFILE] saved 'custom' to kontrol.conf")
+
+
+# ── APP PROFILES (auto-switching) ─────────────────────────────────────────────
+_APP_PROFILES: dict[str, str] = {}
+
+
+def load_app_profiles() -> None:
+    cfg = configparser.ConfigParser()
+    cfg.read(CONF_PATH)
+    _APP_PROFILES.clear()
+    if cfg.has_section("app_profiles"):
+        for app, profile in cfg.items("app_profiles"):
+            _APP_PROFILES[app.lower()] = profile
+
+
+def get_focused_app() -> str:
+    try:
+        r1 = subprocess.run(["xprop", "-root", "_NET_ACTIVE_WINDOW"],
+                            capture_output=True, text=True, timeout=0.05)
+        wid = r1.stdout.strip().split()[-1]
+        if wid in ("0x0", ""):
+            return ""
+        r2 = subprocess.run(["xprop", "-id", wid, "WM_CLASS"],
+                            capture_output=True, text=True, timeout=0.05)
+        parts = r2.stdout.split('"')
+        return parts[-2].lower() if len(parts) >= 2 else ""
+    except Exception:
+        return ""
+
+
+# ── SHARED API & DIAGNOSTIC STATE ─────────────────────────────────────────────
+_api_state: dict = {
+    "hand_detected":  False,
+    "active_gesture": "NONE",
+    "fps":            0.0,
+    "cursor_x":       0,
+    "cursor_y":       0,
+    "current_app":    "",
+    "uptime_start":   time.time(),
+}
+
+_diag: dict = {
+    "raw_lm8_x":    0.0, "raw_lm8_y":    0.0,
+    "smooth_lm8_x": 0.0, "smooth_lm8_y": 0.0,
+    "zone_nx":      0.0, "zone_ny":       0.0,
+    "screen_tx":    0.0, "screen_ty":     0.0,
+    "vel_px":       0.0, "ema_alpha":     0.0,
+    "dx_sent":      0,   "dy_sent":       0,
+}
+
+_diag_gestures: dict = {
+    "bunch_val":        0.0,
+    "tile_dist":        0.0,
+    "three_finger_val": 0.0,
+    "swipe_dx":         0.0,
+    "zoom_delta":       0.0,
+    "rot_ang_vel":      0.0,
+    "scroll_vel":       0.0,
+    "ring_dist":        0.0,
+    "index_dist":       0.0,
+}
+
+DIAGNOSTIC = [False]
+
+# ── FLASK REST API ─────────────────────────────────────────────────────────────
+if _FLASK_OK:
+    _flask_app = Flask("kontrol")
+
+    @_flask_app.route("/status")
+    def api_status():
+        return jsonify({
+            "version":        "1.8",
+            "running":        _running[0],
+            "headless":       HEADLESS[0],
+            "hand_detected":  _api_state["hand_detected"],
+            "active_gesture": _api_state["active_gesture"],
+            "profile":        _active_profile[0],
+            "fps":            round(_api_state["fps"], 1),
+            "cursor_x":       _api_state["cursor_x"],
+            "cursor_y":       _api_state["cursor_y"],
+            "uptime_s":       round(time.time() - _api_state["uptime_start"], 1),
+        })
+
+    @_flask_app.route("/gestures")
+    def api_gestures():
+        return jsonify({"gestures": [
+            {"priority": 1, "name": "bunch",
+             "description": "All 5 tips → Show Desktop",
+             "threshold_key": "bunch_threshold",
+             "threshold_value": _SETTINGS["bunch_threshold"], "enabled": True},
+            {"priority": 2, "name": "tile",
+             "description": "Pinky+Thumb + direction → KDE tile",
+             "threshold_key": "tile_move_threshold",
+             "threshold_value": _SETTINGS["tile_move_threshold"], "enabled": True},
+            {"priority": 3, "name": "three_finger",
+             "description": "Thumb+Index+Middle → KDE overview",
+             "threshold_key": "three_finger_threshold",
+             "threshold_value": _SETTINGS["three_finger_threshold"],
+             "enabled": _SETTINGS["three_finger_threshold"] < 0.5},
+            {"priority": 4, "name": "desktop_swipe",
+             "description": "2 fingers extended + wrist swipe → desktop",
+             "threshold_key": "desktop_swipe_threshold",
+             "threshold_value": _SETTINGS["desktop_swipe_threshold"], "enabled": True},
+            {"priority": 5, "name": "zoom",
+             "description": "Index+middle spread/pinch → Ctrl+/-",
+             "threshold_key": "zoom_threshold",
+             "threshold_value": _SETTINGS["zoom_threshold"],
+             "enabled": _SETTINGS["zoom_threshold"] < 9.0},
+            {"priority": 6, "name": "wrist_rotation",
+             "description": "CW/CCW knuckle rotation → Alt+Tab",
+             "threshold_key": "rotation_threshold",
+             "threshold_value": _SETTINGS["rotation_threshold"],
+             "enabled": _SETTINGS["rotation_threshold"] < 9.0},
+            {"priority": 7, "name": "scroll",
+             "description": "Middle+Thumb + vertical → scroll",
+             "threshold_key": "scroll_deadzone",
+             "threshold_value": _SETTINGS["scroll_deadzone"], "enabled": True},
+            {"priority": 8, "name": "right_click",
+             "description": "Ring+Thumb → right click",
+             "threshold_key": "pinch_threshold",
+             "threshold_value": _SETTINGS["pinch_threshold"], "enabled": True},
+            {"priority": 9, "name": "left_click_drag",
+             "description": "Index+Thumb → left click / drag",
+             "threshold_key": "pinch_threshold",
+             "threshold_value": _SETTINGS["pinch_threshold"], "enabled": True},
+            {"priority": 10, "name": "cursor",
+             "description": "Index fingertip → cursor movement",
+             "threshold_key": None, "threshold_value": None, "enabled": True},
+        ]})
+
+    @_flask_app.route("/profile", methods=["POST"])
+    def api_profile():
+        data = freq.get_json(silent=True) or {}
+        name = data.get("name", "")
+        if name not in _PROFILES:
+            return jsonify({"ok": False, "error": f"profile '{name}' not found"}), 404
+        switch_profile(name)
+        return jsonify({"ok": True, "profile": name})
+
+    @_flask_app.route("/setting", methods=["POST"])
+    def api_setting():
+        data = freq.get_json(silent=True) or {}
+        key  = data.get("key", "")
+        val  = data.get("value")
+        if key not in _SETTINGS or val is None:
+            return jsonify({"ok": False, "error": "unknown key or missing value"}), 400
+        try:
+            _SETTINGS[key] = int(val) if isinstance(_SETTINGS[key], int) else float(val)
+            _save_settings()
+            return jsonify({"ok": True, "key": key, "value": _SETTINGS[key]})
+        except (ValueError, TypeError) as e:
+            return jsonify({"ok": False, "error": str(e)}), 400
+
+    @_flask_app.route("/headless", methods=["POST"])
+    def api_headless():
+        data = freq.get_json(silent=True) or {}
+        HEADLESS[0] = bool(data.get("enabled", True))
+        return jsonify({"ok": True, "headless": HEADLESS[0]})
+
+    @_flask_app.route("/stop", methods=["POST"])
+    def api_stop():
+        _running[0] = False
+        return jsonify({"ok": True, "message": "shutting down"})
+
+    @_flask_app.route("/log")
+    def api_log():
+        log_path = Path.home() / ".local/share/kontrol.log"
+        try:
+            lines = log_path.read_text().splitlines()[-50:]
+        except FileNotFoundError:
+            lines = []
+        return jsonify({"lines": lines})
+
+    @_flask_app.route("/app-profiles")
+    def api_app_profiles():
+        return jsonify({
+            "app_profiles": _APP_PROFILES,
+            "current_app":  _api_state["current_app"],
+            "auto_switched": bool(_APP_PROFILES),
+        })
+
+    @_flask_app.route("/app-profile", methods=["POST"])
+    def api_app_profile():
+        data    = freq.get_json(silent=True) or {}
+        app_key = data.get("app", "").lower()
+        profile = data.get("profile", "")
+        if not app_key or profile not in _PROFILES:
+            return jsonify({"ok": False, "error": "invalid app or profile"}), 400
+        _APP_PROFILES[app_key] = profile
+        cfg = configparser.ConfigParser()
+        cfg.read(CONF_PATH)
+        if not cfg.has_section("app_profiles"):
+            cfg.add_section("app_profiles")
+        cfg.set("app_profiles", app_key, profile)
+        with open(CONF_PATH, "w") as f:
+            cfg.write(f)
+        return jsonify({"ok": True})
+
+    @_flask_app.route("/diagnostic")
+    def api_diagnostic():
+        return jsonify({
+            "gesture_states":  dict(_diag_gestures),
+            "cursor_pipeline": dict(_diag),
+        })
+
+    def start_api_server(host: str = "127.0.0.1", port: int = 5555) -> None:
+        import logging
+        logging.getLogger("werkzeug").setLevel(logging.ERROR)
+        t = threading.Thread(
+            target=lambda: _flask_app.run(
+                host=host, port=port, debug=False, use_reloader=False
+            ),
+            daemon=True, name="kontrol-api",
+        )
+        t.start()
+        print(f"[API] listening on http://{host}:{port}")
+
+else:
+    def start_api_server(host: str = "127.0.0.1", port: int = 5555) -> None:
+        print("[API] Flask not available — API disabled")
+
 
 # ── VISUALIZATION CONSTANTS ───────────────────────────────────────────────────
 FINGER_COLORS = {
@@ -551,6 +795,10 @@ def build_panel_rows() -> list[dict]:
     row("desktop_swipe_threshold", "Swipe Threshold")
     row("desktop_swipe_cooldown",  "Swipe Cooldown")
 
+    section("-- ZOOM (INDEX+MIDDLE SPREAD) --")
+    row("zoom_threshold", "Zoom Threshold")
+    row("zoom_cooldown",  "Zoom Cooldown")
+
     return rows
 
 
@@ -604,6 +852,13 @@ def is_two_finger_extended(lm) -> bool:
         lm[16].y > lm[13].y and   # ring bent
         lm[20].y > lm[17].y       # pinky bent
     )
+
+
+def is_zoom_pose(lm) -> bool:
+    idx_up    = lm[8].y  < lm[6].y
+    mid_up    = lm[12].y < lm[10].y
+    thumb_far = pdist(lm, 4, 8) > 0.08 and pdist(lm, 4, 12) > 0.08
+    return idx_up and mid_up and thumb_far
 
 
 # ── CAMERA ────────────────────────────────────────────────────────────────────
@@ -688,6 +943,16 @@ def draw_skeleton(frame, lm, fw: int, fh: int, active_pinches: dict) -> None:
             [int(lm[12].x * fw), int(lm[12].y * fh)],
         ], dtype=np.int32)
         cv2.polylines(frame, [pts], True, (220, 50, 220), 2, cv2.LINE_AA)
+
+    zoom_delta = active_pinches.get("zoom_delta")
+    if zoom_delta is not None:
+        current_dist = pdist(lm, 8, 12)
+        thickness = max(1, int(current_dist * 15))
+        color = (50, 220, 50) if zoom_delta >= 0 else (80, 80, 220)
+        cv2.line(frame,
+                 (int(lm[8].x * fw),  int(lm[8].y * fh)),
+                 (int(lm[12].x * fw), int(lm[12].y * fh)),
+                 color, thickness, cv2.LINE_AA)
 
     if SHOW_LM_NUMBERS:
         for i in range(21):
@@ -996,6 +1261,73 @@ def draw_buttons(frame) -> None:
                 cv2.FONT_HERSHEY_SIMPLEX, 0.45, (220, 200, 100), 1)
 
 
+# ── DIAGNOSTIC OVERLAY ───────────────────────────────────────────────────────
+def draw_diagnostic(frame, lm, now: float) -> None:
+    fw, fh = frame.shape[1], frame.shape[0]
+    font   = cv2.FONT_HERSHEY_SIMPLEX
+
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (0, 0), (fw, fh), (5, 5, 15), -1)
+    cv2.addWeighted(overlay, 0.75, frame, 0.25, 0, frame)
+
+    cv2.putText(frame, "DIAGNOSTIC  [D to exit]",
+                (10, 20), font, 0.50, (100, 100, 255), 1)
+
+    gesture_rows = [
+        ("P1 BUNCH",   _diag_gestures["bunch_val"],    _SETTINGS["bunch_threshold"]),
+        ("P2 TILE",    _diag_gestures["tile_dist"],     _SETTINGS["tile_move_threshold"]),
+        ("P3 3-FIN",   _diag_gestures["three_finger_val"], _SETTINGS["three_finger_threshold"]),
+        ("P4 SWIPE",   abs(_diag_gestures["swipe_dx"]), _SETTINGS["desktop_swipe_threshold"]),
+        ("P5 ZOOM",    abs(_diag_gestures["zoom_delta"]), _SETTINGS["zoom_threshold"]),
+        ("P6 ROT",     abs(_diag_gestures["rot_ang_vel"]), _SETTINGS["rotation_threshold"]),
+        ("P7 SCROLL",  abs(_diag_gestures["scroll_vel"]), _SETTINGS["scroll_deadzone"]),
+        ("P8 R-CLICK", _diag_gestures["ring_dist"],    _SETTINGS["pinch_threshold"]),
+        ("P9 L-CLICK", _diag_gestures["index_dist"],   _SETTINGS["pinch_threshold"]),
+    ]
+    for i, (name, val, thr) in enumerate(gesture_rows):
+        gy    = 38 + i * 26
+        ratio = val / thr if thr > 0 else 999
+        if ratio < 1.0:
+            color  = (50, 220, 50)
+            status = "ACTIVE"
+        elif ratio < 1.5:
+            color  = (50, 220, 220)
+            status = f"{ratio:.1f}x"
+        else:
+            color  = (100, 100, 100)
+            status = "---"
+        cv2.putText(frame, f"{name:<10} {val:.3f}/{thr:.3f} {status}",
+                    (10, gy), font, 0.36, color, 1)
+
+    cv2.putText(frame, "CURSOR PIPELINE",
+                (335, 32), font, 0.42, (180, 180, 180), 1)
+    pipe_rows = [
+        ("Raw LM8",    f"x={_diag['raw_lm8_x']:.3f} y={_diag['raw_lm8_y']:.3f}"),
+        ("Smoothed",   f"x={_diag['smooth_lm8_x']:.3f} y={_diag['smooth_lm8_y']:.3f}"),
+        ("Zone map",   f"x={_diag['zone_nx']:.3f} y={_diag['zone_ny']:.3f}"),
+        ("Screen px",  f"x={_diag['screen_tx']:.0f} y={_diag['screen_ty']:.0f}"),
+        ("Velocity",   f"{_diag['vel_px']:.1f} px/frame"),
+        ("EMA alpha",  f"{_diag['ema_alpha']:.3f}"),
+        ("Delta sent", f"dx={_diag['dx_sent']:+d} dy={_diag['dy_sent']:+d}"),
+    ]
+    for i, (label, val) in enumerate(pipe_rows):
+        py = 50 + i * 22
+        cv2.putText(frame, f"{label:<12} {val}",
+                    (335, py), font, 0.36, (200, 200, 200), 1)
+
+    if lm:
+        cv2.putText(frame, "LANDMARKS (x, y, z)",
+                    (10, fh - 112), font, 0.36, (140, 140, 140), 1)
+        for i in range(21):
+            col = i % 4
+            row = i // 4
+            lx  = 10  + col * 155
+            ly  = fh - 96 + row * 17
+            cv2.putText(frame,
+                        f"L{i:02d} {lm[i].x:.2f},{lm[i].y:.2f},{lm[i].z:.2f}",
+                        (lx, ly), font, 0.28, (120, 120, 120), 1)
+
+
 # ── STARTUP SOUND ─────────────────────────────────────────────────────────────
 def play_startup_sound() -> None:
     rate, amp = 22050, 28000
@@ -1033,16 +1365,24 @@ def run_cursor_pipeline(
     reentry: bool,
 ) -> tuple:
     lx, ly = lm[8].x, lm[8].y
+    _diag["raw_lm8_x"] = lx
+    _diag["raw_lm8_y"] = ly
 
     if raw_x_s is None:
         raw_x_s, raw_y_s = lx, ly
     raw_x_s += (lx - raw_x_s) * LANDMARK_SMOOTH
     raw_y_s += (ly - raw_y_s) * LANDMARK_SMOOTH
+    _diag["smooth_lm8_x"] = raw_x_s
+    _diag["smooth_lm8_y"] = raw_y_s
 
     nx = max(0.0, min(1.0, (raw_x_s - ZONE_X_MIN) / (ZONE_X_MAX - ZONE_X_MIN)))
     ny = max(0.0, min(1.0, (raw_y_s - ZONE_Y_MIN) / (ZONE_Y_MAX - ZONE_Y_MIN)))
     tx = nx * SCREEN_W
     ty = ny * SCREEN_H
+    _diag["zone_nx"]   = nx
+    _diag["zone_ny"]   = ny
+    _diag["screen_tx"] = tx
+    _diag["screen_ty"] = ty
 
     if reentry:
         cx, cy = tx, ty
@@ -1053,13 +1393,17 @@ def run_cursor_pipeline(
     vel_px   = math.hypot(tx - prev_tx, ty - prev_ty)
     vel_norm = vel_px / SCREEN_DIAG
     prev_tx, prev_ty = tx, ty
+    _diag["vel_px"] = vel_px
 
     alpha = max(MIN_SMOOTH, min(MAX_SMOOTH, vel_norm * VELOCITY_SCALE))
+    _diag["ema_alpha"] = alpha
     cx += (tx - cx) * alpha
     cy += (ty - cy) * alpha
 
     dx = round(cx - prev_sent_x)
     dy = round(cy - prev_sent_y)
+    _diag["dx_sent"] = dx
+    _diag["dy_sent"] = dy
     if max(abs(dx), abs(dy)) >= CURSOR_DEADZONE_PX:
         subprocess.Popen(
             ["ydotool", "mousemove", "-x", str(dx), "-y", str(dy)],
@@ -1114,13 +1458,19 @@ def run() -> None:
 
     play_startup_sound()
 
-    win_name = "Kontrol v1.7"
+    win_name = "Kontrol v1.8"
     if not HEADLESS[0]:
         cv2.namedWindow(win_name)
         cv2.setMouseCallback(win_name, _mouse_cb)
         notify("Kontrol started")
     else:
         notify("Kontrol started (headless)")
+
+    load_app_profiles()
+    if _cfg.getboolean("system", "api_enabled", fallback=False) and _FLASK_OK:
+        _api_host = _cfg.get("system", "api_host", fallback="127.0.0.1")
+        _api_port = _cfg.getint("system", "api_port", fallback=5555)
+        start_api_server(_api_host, _api_port)
 
     # ── CURSOR STATE ──────────────────────────────────────────────────────────
     raw_x_s: float | None = None
@@ -1156,7 +1506,12 @@ def run() -> None:
     swipe_fired:   bool         = False
     last_swipe_t:  float        = 0.0
 
-    # ── GESTURE STATE — wrist rotation (priority 5) ──────────────────────────
+    # ── GESTURE STATE — zoom (priority 5) ────────────────────────────────────
+    zoom_ref_dist: float | None = None
+    zoom_last_t:   float        = 0.0
+    zoom_active:   bool         = False
+
+    # ── GESTURE STATE — wrist rotation (priority 6) ──────────────────────────
     rot_angle_history: deque = deque(maxlen=12)
     rot_last_fired_t:  float = 0.0
     ROT_MIN_FRAMES:    int   = _cfg.getint("gestures", "rotation_min_frames")
@@ -1176,6 +1531,11 @@ def run() -> None:
     drag_active:     bool  = False
     last_drag_end_t: float = 0.0
 
+    # ── AUTO PROFILE STATE ────────────────────────────────────────────────────
+    _last_focus_check:    float = 0.0
+    _last_focused_app:    str   = ""
+    FOCUS_CHECK_INTERVAL: float = 2.0
+
     # ── HUD STATE ─────────────────────────────────────────────────────────────
     active_gesture: str   = "NONE"
     flash_msg:      str   = ""
@@ -1191,12 +1551,12 @@ def run() -> None:
     pd_3f: float = 1.0
 
     print(
-        f"Kontrol v1.7  {SCREEN_W}x{SCREEN_H}"
+        f"Kontrol v1.8  {SCREEN_W}x{SCREEN_H}"
         f"  cam=/dev/video{CAM_ID}"
         f"  pinch={_SETTINGS['pinch_threshold']}  3f={_SETTINGS['three_finger_threshold']}"
         f"  bunch={_SETTINGS['bunch_threshold']}/{_SETTINGS['bunch_hold_frames']}fr"
         f"  headless={'yes' if HEADLESS[0] else 'no'}"
-        f"  [n]=LM  [i]=info  [s]=settings  [h]=headless  [1/2/3]=profile  [q]=quit"
+        f"  [n]=LM  [i]=info  [s]=settings  [h]=headless  [1/2/3]=profile  [d]=diag  [q]=quit"
     )
 
     _last_ts_ms: int = 0
@@ -1240,6 +1600,12 @@ def run() -> None:
                 pd_rt = pdist(lm, 4, 16)
                 pd_pt = pdist(lm, 4, 20)
                 pd_3f = min(pd_it, pd_mt)
+
+                _diag_gestures["index_dist"]       = pd_it
+                _diag_gestures["ring_dist"]         = pd_rt
+                _diag_gestures["three_finger_val"]  = pd_3f
+                _diag_gestures["bunch_val"]         = max(pd_it, pd_mt, pd_rt, pd_pt)
+                zoom_active = False
 
                 rot_angle_history.append((now, knuckle_angle(lm)))
 
@@ -1338,37 +1704,78 @@ def run() -> None:
                             # ════════════════════════════════════════════════
                             # PRIORITY 4 — TWO-FINGER SWIPE → DESKTOP
                             # ════════════════════════════════════════════════
-                            if is_two_finger_extended(lm):
+                            if is_two_finger_extended(lm) and not swipe_fired:
                                 was_gesturing = True
                                 if swipe_start_x is None:
                                     swipe_start_x = lm[8].x
-                                    swipe_fired   = False
 
-                                if not swipe_fired:
-                                    dx_swipe = lm[8].x - swipe_start_x
-                                    if (abs(dx_swipe) > _SETTINGS["desktop_swipe_threshold"]
-                                            and (now - last_swipe_t)
-                                                > _SETTINGS["desktop_swipe_cooldown"]):
-                                        if dx_swipe > 0:
-                                            fire_kwin("desktop_right")
-                                            flash_msg = "DESKTOP →"
-                                        else:
-                                            fire_kwin("desktop_left")
-                                            flash_msg = "← DESKTOP"
-                                        flash_color    = (0, 220, 220)
-                                        flash_until    = now + 0.6
-                                        swipe_fired    = True
-                                        last_swipe_t   = now
-                                        active_gesture = flash_msg
+                                dx_swipe = lm[8].x - swipe_start_x
+                                _diag_gestures["swipe_dx"] = dx_swipe
+                                if (abs(dx_swipe) > _SETTINGS["desktop_swipe_threshold"]
+                                        and (now - last_swipe_t)
+                                            > _SETTINGS["desktop_swipe_cooldown"]):
+                                    if dx_swipe > 0:
+                                        fire_kwin("desktop_right")
+                                        flash_msg = "DESKTOP →"
+                                    else:
+                                        fire_kwin("desktop_left")
+                                        flash_msg = "← DESKTOP"
+                                    flash_color    = (0, 220, 220)
+                                    flash_until    = now + 0.6
+                                    swipe_fired    = True
+                                    last_swipe_t   = now
+                                    active_gesture = flash_msg
                                 else:
-                                    active_gesture = "SWIPE HOLD"
+                                    active_gesture = f"SWIPE  dx={dx_swipe:+.3f}"
+
+                            elif is_zoom_pose(lm):
+                                # ════════════════════════════════════════════
+                                # PRIORITY 5 — ZOOM (INDEX+MIDDLE SPREAD)
+                                # ════════════════════════════════════════════
+                                was_gesturing = True
+                                zoom_active   = True
+                                if zoom_ref_dist is None:
+                                    zoom_ref_dist = pdist(lm, 8, 12)
+
+                                cur_dist      = pdist(lm, 8, 12)
+                                zd            = cur_dist - zoom_ref_dist
+                                zoom_ref_dist = cur_dist
+                                _diag_gestures["zoom_delta"] = zd
+
+                                if (abs(zd) > _SETTINGS["zoom_threshold"]
+                                        and (now - zoom_last_t) > _SETTINGS["zoom_cooldown"]):
+                                    if zd > 0:
+                                        subprocess.run(
+                                            ["ydotool", "key",
+                                             "29:1", "78:1", "78:0", "29:0"],
+                                            env=os.environ,
+                                            stdout=subprocess.DEVNULL,
+                                            stderr=subprocess.DEVNULL,
+                                        )
+                                        flash_msg = "ZOOM IN"
+                                    else:
+                                        subprocess.run(
+                                            ["ydotool", "key",
+                                             "29:1", "74:1", "74:0", "29:0"],
+                                            env=os.environ,
+                                            stdout=subprocess.DEVNULL,
+                                            stderr=subprocess.DEVNULL,
+                                        )
+                                        flash_msg = "ZOOM OUT"
+                                    flash_color    = (50, 220, 50)
+                                    flash_until    = now + 0.6
+                                    zoom_last_t    = now
+                                    active_gesture = flash_msg
+                                else:
+                                    active_gesture = f"ZOOM  d={zd:+.3f}"
 
                             else:
                                 swipe_start_x = None
                                 swipe_fired   = False
+                                zoom_ref_dist = None
 
                                 # ════════════════════════════════════════════
-                                # PRIORITY 5 — WRIST ROTATION → ALT+TAB
+                                # PRIORITY 6 — WRIST ROTATION → ALT+TAB
                                 # ════════════════════════════════════════════
                                 rotation_direction = None
 
@@ -1385,6 +1792,7 @@ def run() -> None:
                                             raw_delta += 2 * math.pi
 
                                         ang_vel = raw_delta / rot_dt
+                                        _diag_gestures["rot_ang_vel"] = ang_vel
 
                                         if abs(ang_vel) > _SETTINGS["rotation_threshold"]:
                                             rotation_direction = "CW" if ang_vel < 0 else "CCW"
@@ -1439,6 +1847,7 @@ def run() -> None:
                                             scroll_vel * (1.0 - _SETTINGS["scroll_vel_alpha"])
                                             + dy_norm  * _SETTINGS["scroll_vel_alpha"]
                                         )
+                                        _diag_gestures["scroll_vel"] = scroll_vel
 
                                         if abs(scroll_vel) > _SETTINGS["scroll_deadzone"]:
                                             ticks = max(1, min(
@@ -1540,7 +1949,10 @@ def run() -> None:
 
                 draw_skeleton(frame, lm, fw_px, fh_px, {
                     "three_finger": three_finger_active,
+                    "zoom_delta":   _diag_gestures["zoom_delta"] if zoom_active else None,
                 })
+                if DIAGNOSTIC[0]:
+                    draw_diagnostic(frame, lm, now)
                 draw_zone_warning(frame, lm, fw_px, fh_px)
                 if SHOW_LM_INFO:
                     draw_lm_info(frame, lm, fw_px, fh_px)
@@ -1571,8 +1983,27 @@ def run() -> None:
                 tile_fired        = False
                 swipe_start_x     = None
                 swipe_fired       = False
+                zoom_ref_dist     = None
+                zoom_active       = False
                 was_gesturing     = True
                 active_gesture    = "NO HAND"
+
+            _api_state["fps"]           = round(fps, 1)
+            _api_state["hand_detected"] = bool(result.hand_landmarks)
+            _api_state["active_gesture"] = active_gesture
+            _api_state["cursor_x"]      = int(prev_sent_x)
+            _api_state["cursor_y"]      = int(prev_sent_y)
+
+            if now - _last_focus_check > FOCUS_CHECK_INTERVAL:
+                _last_focus_check = now
+                _focused = get_focused_app()
+                _api_state["current_app"] = _focused
+                if _focused and _focused != _last_focused_app:
+                    _last_focused_app = _focused
+                    if _focused in _APP_PROFILES:
+                        _tgt = _APP_PROFILES[_focused]
+                        if _tgt != _active_profile[0]:
+                            switch_profile(_tgt)
 
             if not HEADLESS[0]:
                 if _settings_open[0]:
@@ -1642,6 +2073,9 @@ def run() -> None:
                     flash_msg   = "PROFILE: custom saved"
                     flash_color = (100, 220, 100)
                     flash_until = now + 1.0
+                elif key in (ord("d"), ord("D")):
+                    DIAGNOSTIC[0] = not DIAGNOSTIC[0]
+                    print(f"[DIAG] diagnostic mode {'ON' if DIAGNOSTIC[0] else 'OFF'}")
             else:
                 if not _running[0]:
                     break
