@@ -1,5 +1,59 @@
 # Kontrol CHANGELOG v2
 
+## v1.8 — Flask REST API, auto profile switching, zoom gesture, diagnostic mode (session 9)
+
+### Mission 1 — Flask REST API on :5555
+- Flask 3.1.x daemon thread (`name="kontrol-api"`) starts if `api_enabled = true` in kontrol.conf
+- Guard: `try: from flask import Flask ... _FLASK_OK = True except ImportError: _FLASK_OK = False`
+- 10 endpoints: GET /status, /gestures, /log, /app-profiles, /diagnostic; POST /profile, /setting, /headless, /stop, /app-profile
+- Shared `_api_state` dict (fps, hand_detected, active_gesture, cursor_x/y, current_app, uptime_start) updated every frame
+- GET /log returns last 50 lines of `~/.local/share/kontrol.log`
+- kontrol.conf gains `api_enabled = true`, `api_host = 127.0.0.1`, `api_port = 5555`
+
+### Mission 2 — Auto profile switching on focused app
+- `get_focused_app()` — reads `_NET_ACTIVE_WINDOW` via xprop → WM_CLASS → lowercase app name
+- `load_app_profiles()` — parses `[app_profiles]` section from kontrol.conf into `_APP_PROFILES`
+- Main loop polls every 2s; on app change, looks up `_APP_PROFILES`, calls `switch_profile()` if different
+- `_api_state["current_app"]` updated each poll cycle
+- POST /app-profile endpoint writes new mapping to kontrol.conf
+- `[app_profiles]` defaults: firefox/chromium→default, code/jetbrains/gimp→precise, mpv/vlc/obs/kdenlive→presentation
+
+### Mission 3 — Zoom gesture (index+middle spread/pinch → Ctrl+±)
+- `is_zoom_pose(lm)` — index+middle up, thumb far (pdist(4,8) > 0.08 AND pdist(4,12) > 0.08)
+- New Priority 5 between desktop swipe (P4) and wrist rotation (P6)
+- Swipe condition changed to `is_two_finger_extended(lm) and not swipe_fired` to allow zoom after swipe fires
+- Zoom-in (spread): `ydotool key 29:1 78:1 78:0 29:0` (Ctrl+Plus)
+- Zoom-out (pinch): `ydotool key 29:1 74:1 74:0 29:0` (Ctrl+Minus)
+- `zoom_ref_dist` — cumulative delta computed each frame while in zoom pose; reset on hand lost or else-branch
+- Flash: "ZOOM IN" / "ZOOM OUT" in green (50, 220, 50)
+- `draw_skeleton()` shows index–middle line with thickness scaling and green/blue color by direction
+- Settings panel gains "-- ZOOM (INDEX+MIDDLE SPREAD) --" section (zoom_threshold, zoom_cooldown)
+- All three `_PROFILES` updated with zoom_threshold/zoom_cooldown; presentation sets threshold 9.99
+- kontrol.conf gains `zoom_threshold = 0.06`, `zoom_cooldown = 0.4`
+
+### Mission 4 — Diagnostic mode (D key)
+- `DIAGNOSTIC = [False]` module-level list; D key toggles
+- `draw_diagnostic(frame, lm, now)` — dark 75% alpha overlay with two columns:
+  - Left: 9 gesture state rows (P1 BUNCH through P9 L-CLICK) with ratio-based green/amber/red coloring
+  - Right: 7 cursor pipeline rows (Raw LM8, Smoothed, Zone map, Screen px, Velocity, EMA alpha, Delta sent)
+  - Bottom: 21 landmark coords in 4-column grid
+- `_diag` dict instrumented throughout `run_cursor_pipeline()` (raw_lm8, smooth_lm8, zone_nx/ny, screen_tx/ty, vel_px, ema_alpha, dx/dy_sent)
+- `_diag_gestures` dict instrumented: bunch_val, ring_dist, index_dist, three_finger_val, swipe_dx, zoom_delta, rot_ang_vel, scroll_vel
+- GET /diagnostic endpoint returns both dicts for headless diagnostics
+- D key works only in windowed mode; print confirms toggle
+
+### Priority chain after v1.8
+P1 BUNCH → P2 PINKY+THUMB tile → P3 THREE-FINGER pinch → P4 TWO-FINGER swipe
+→ P5 ZOOM → P6 WRIST ROTATION → P7 MIDDLE+THUMB scroll → P8 RING+THUMB r-click
+→ P9 INDEX+THUMB click/drag → cursor
+
+### kontrol.conf
+- `[gestures]` gains: `zoom_threshold = 0.06`, `zoom_cooldown = 0.4`
+- `[system]` gains: `api_enabled = true`, `api_host = 127.0.0.1`, `api_port = 5555`
+- `[app_profiles]` section added with 9 default app→profile mappings
+
+---
+
 ## v1.7 — headless mode, gesture profiles, desktop swipe, systemd autostart (session 8)
 
 ### Mission 1 — Headless mode
