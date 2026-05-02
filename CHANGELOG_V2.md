@@ -1,5 +1,20 @@
 # Kontrol CHANGELOG v2
 
+## v1.8.1 — Wrist rotation priority fix, autostart disabled (session 10)
+
+### Fix — Wrist rotation restored to priority 4
+- v1.8 demoted rotation to P6 inside `else(is_two_finger_extended || is_zoom_pose)` — any open-hand pose blocked it
+- Restructured gesture chain: rotation now uses `if/elif` chain at P4, before swipe (P5) and zoom (P6)
+- Rotation fires before swipe/zoom detection; clears swipe/zoom state when fired
+- Swipe/zoom/scroll/click/drag/cursor priorities renumbered P5→P10
+- Eliminates gesture mismatch where rotation was silently blocked by two-finger pose detection
+
+### Fix — Kontrol no longer auto-starts on login
+- Disabled `kontrol.service` user systemd unit (was enabled in graphical-session.target.wants)
+
+### Cleanup — Removed net-tools (netstat)
+- Uninstalled net-tools package, removing /usr/bin/netstat
+
 ## v1.8 — Flask REST API, auto profile switching, zoom gesture, diagnostic mode (session 9)
 
 ### Mission 1 — Flask REST API on :5555
