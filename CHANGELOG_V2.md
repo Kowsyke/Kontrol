@@ -1,5 +1,43 @@
 # Kontrol CHANGELOG v2
 
+## Fedora 44 Migration — 2026-05-15 (session 11)
+
+### Audit results — all 10 patterns checked
+
+| Pattern | Status | Detail |
+|---------|--------|--------|
+| A) Python version bump | OK | Python 3.14.4 in system AND venv — no change |
+| B) MediaPipe wheel | OK | 0.10.33 imports fine, HandLandmarker init OK |
+| C) OpenCV rebuild | OK | 4.13.0.92 imports fine, camera opens |
+| D) ydotool API change | OK | mousemove and --wheel both exit 0 |
+| E) ydotoold service | OK | Active, socket at /run/user/1000/.ydotool_socket |
+| F) udev cam rule | OK | Rule intact, IMC cam suppressed, C920 on /dev/video0 |
+| G) Camera device path | OK | C920 still /dev/video0, brightness 176.9 |
+| H) KDE/KWin D-Bus | OK | Plasma 6.6.4, invokeShortcut exit 0 |
+| I) Wayland socket | OK | WAYLAND_DISPLAY=wayland-0, DISPLAY=:0 |
+| J) NumPy 2.0 ABI | OK | NumPy 2.4.4, no ABI errors with mediapipe/cv2 |
+
+### Changed (non-breaking)
+- `hdd-storage.service` no longer exists — storage mounts via /etc/fstab instead; /home/K/Storage accessible
+- Mesa: 25.3.6 → 26.0.6 (OpenGL ES 3.2 — no functional impact)
+- KDE Plasma: bumped to 6.6.4 (D-Bus API unchanged)
+
+### Confirmed working versions (Fedora 44)
+- Python: 3.14.4
+- MediaPipe: 0.10.33
+- OpenCV: 4.13.0.92
+- NumPy: 2.4.4
+- Flask: 3.1.3
+- ydotool: Fedora 44 package (mousemove + --wheel verified OK)
+- KDE Plasma: 6.6.4
+- Camera: /dev/video0 (C920, brightness 176.9 after settings)
+- API: 19.2 FPS, hand_detected, /status responding
+
+### Fixes applied
+- None required — all components operational post-upgrade
+- Updated CLAUDE.md: Fedora 43 → Fedora 44, added confirmed versions, display env, hdd-storage note
+- Updated requirements.txt: pip freeze of current working venv
+
 ## v1.8.1 — Wrist rotation priority fix, autostart disabled (session 10)
 
 ### Fix — Wrist rotation restored to priority 4
